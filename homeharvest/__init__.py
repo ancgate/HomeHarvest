@@ -13,6 +13,7 @@ from .maps import (
     to_osm_map, to_google_maps, to_kml, to_google_my_maps_csv, to_geojson, export_map, generate_map,
     cluster_properties,
 )
+from .nearby import add_nearby, list_aspects, normalize_proximity, nearby_columns
 from .locations import (
     get_states, get_state, get_counties, get_cities, get_zip_codes, get_location_hierarchy, aggregate_locations
 )
@@ -74,6 +75,10 @@ def scrape_property(
     # Polite request handling
     requests_per_second: float | None = 2.0,
     max_retries: int = 4,
+    # Real distances to OpenStreetMap features
+    near: dict | list | str = None,
+    far_from: dict | list | str = None,
+    overpass_url: str = None,
 ) -> Union[pd.DataFrame, list[dict], list[Property]]:
     """
     Scrape properties from Realtor.com based on a given location and listing type.
@@ -152,6 +157,18 @@ def scrape_property(
     :param include_market_stats: Realtor.com rent estimate plus neighborhood and ZIP medians
         (median rent, listing price, sold price, price per sqft, days on market).
 
+    Real distances to OpenStreetMap features (see homeharvest.list_aspects()):
+    :param near: Keep listings within a distance of each aspect, e.g. {"cul_de_sac": "300 ft", "water": "0.5 mi"}.
+        A list uses each aspect's default radius. Aspects: cul_de_sac, dead_end, road, paved_road, dirt_road,
+        major_road, freeway, water, lake, river, canal, coastline, beach, wetland, park, protected_area, forest,
+        golf_course, school, hospital, fire_station, grocery, gas_station, town, airport, railroad, power_line,
+        substation, cell_tower, landfill, industrial, cemetery, boat_ramp, marina, or a raw OSM tag such as
+        "leisure=marina". Numbers are feet; strings may use ft, mi, m, km, yd.
+    :param far_from: Keep listings with no such feature within the distance, e.g. {"power_line": "500 ft"}.
+        Adds <aspect>_ft and <aspect>_name columns. Runs after the other filters (and after `limit`), using
+        the public Overpass API (cached for 7 days); listings without coordinates are dropped.
+    :param overpass_url: Another Overpass endpoint (also via the HOMEHARVEST_OVERPASS_URL env var).
+
     Polite request handling:
     :param requests_per_second: Shared rate limit for all requests to Realtor.com in this process
         (default 2.0, with +/-20% jitter). None or 0 disables it.
@@ -179,6 +196,9 @@ def scrape_property(
 
     #: validate feature keys / match mode up front (raises ValueError with suggestions)
     feature_matcher = FeatureMatcher(features=features, nearby=nearby, keywords=keywords, match_mode=match_mode)
+    near_spec = normalize_proximity(near, "near")
+    far_spec = normalize_proximity(far_from, "far_from")
+    proximity_columns = nearby_columns({**near_spec, **far_spec})
 
     # Validate new last_update_date filtering parameters
     validate_last_update_filters(
@@ -275,6 +295,9 @@ def scrape_property(
         include_market_stats=include_market_stats,
         requests_per_second=requests_per_second,
         max_retries=max_retries,
+        near=near,
+        far_from=far_from,
+        overpass_url=overpass_url,
     )
 
     site = RealtorScraper(scraper_input)
@@ -292,9 +315,11 @@ def scrape_property(
             ("market_stats", include_market_stats),
         ) if enabled
     ]
-    columns = get_columns(extra_groups)
+    columns = get_columns(extra_groups, proximity_columns)
 
-    properties_dfs = [df for result in results if not (df := process_result(result, extra_groups)).empty]
+    properties_dfs = [
+        df for result in results if not (df := process_result(result, extra_groups, proximity_columns)).empty
+    ]
     if not properties_dfs:
         return pd.DataFrame()
 

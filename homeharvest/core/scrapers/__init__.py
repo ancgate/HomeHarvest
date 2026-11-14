@@ -1,5 +1,5 @@
 from __future__ import annotations
-from typing import Union
+from typing import Any, Union
 
 import requests
 import uuid
@@ -96,6 +96,11 @@ class ScraperInput(BaseModel):
     requests_per_second: float | None = 2.0
     max_retries: int = 4
 
+    # OpenStreetMap proximity filters (see homeharvest.nearby)
+    near: Any = None
+    far_from: Any = None
+    overpass_url: str | None = None
+
 
 class Scraper:
     def __init__(
@@ -172,6 +177,11 @@ class Scraper:
         # Polite request handling
         self.requests_per_second = scraper_input.requests_per_second
         self.max_retries = scraper_input.max_retries
+
+        # OpenStreetMap proximity filters
+        self.near = scraper_input.near
+        self.far_from = scraper_input.far_from
+        self.overpass_url = scraper_input.overpass_url
 
     def search(self) -> list[Union[Property | dict]]: ...
 

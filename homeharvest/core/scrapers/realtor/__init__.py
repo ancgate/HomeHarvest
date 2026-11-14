@@ -49,6 +49,7 @@ from .processors import (
 )
 from .details import apply_details_to_property, apply_details_to_raw
 from ....features import filter_properties
+from .... import nearby as nearby_module
 
 
 class PropertyDetailsError(Exception):
@@ -669,6 +670,12 @@ class RealtorScraper(Scraper):
                 nearby=self.nearby,
                 keywords=self.keywords,
                 match_mode=self.match_mode,
+            )
+        if self.near or self.far_from:
+            #: real distances to OpenStreetMap features, measured after the cheaper filters
+            homes = nearby_module.apply_proximity(
+                homes, near=self.near, far_from=self.far_from, overpass_url=self.overpass_url,
+                client=nearby_module.get_overpass_client(self.overpass_url),
             )
         return homes
 

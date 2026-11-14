@@ -32,3 +32,7 @@ class RequestFailedError(Exception):
     def __init__(self, *args, response=None):
         super().__init__(*args)
         self.response = response
+
+
+class OverpassError(RuntimeError):
+    """Raised when the OpenStreetMap Overpass API keeps failing (overloaded, timeouts...)."""

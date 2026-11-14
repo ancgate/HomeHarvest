@@ -137,20 +137,27 @@ OPTIONAL_COLUMNS = {
 }
 
 
-def get_columns(extra_groups=None) -> list[str]:
-    """Base DataFrame columns plus any optional column groups (see OPTIONAL_COLUMNS)."""
+def get_columns(extra_groups=None, extra_columns=None) -> list[str]:
+    """Base DataFrame columns plus optional column groups (see OPTIONAL_COLUMNS) and extra columns."""
     columns = list(ordered_properties)
     for group in extra_groups or []:
         for column in OPTIONAL_COLUMNS.get(group, []):
             if column not in columns:
                 columns.append(column)
+    for column in extra_columns or []:
+        if column not in columns:
+            columns.append(column)
     return columns
 
 
-def process_result(result: Property, extra_groups=None) -> pd.DataFrame:
-    columns = get_columns(extra_groups)
+def process_result(result: Property, extra_groups=None, extra_columns=None) -> pd.DataFrame:
+    nearby_columns = [f"{aspect}_{suffix}" for aspect in (result.nearby or {}) for suffix in ("ft", "name")]
+    columns = get_columns(extra_groups, list(extra_columns or []) + nearby_columns)
     prop_data = {prop: None for prop in columns}
     prop_data.update(result.model_dump())
+    for aspect, feature in (result.nearby or {}).items():
+        prop_data[f"{aspect}_ft"] = feature.distance_ft
+        prop_data[f"{aspect}_name"] = feature.name
 
     if "address" in prop_data and prop_data["address"]:
         address_data = prop_data["address"]
