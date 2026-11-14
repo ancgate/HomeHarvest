@@ -42,10 +42,14 @@ __all__ = [
     "to_google_my_maps_csv",
     "to_geojson",
     "export_map",
+    "generate_map",
+    "cluster_properties",
     "property_points",
 ]
 
 LEAFLET_VERSION = "1.9.4"
+
+HIGHLIGHT_COLOR = "#d50000"
 
 STATUS_COLORS = {
     "FOR_SALE": "#2e7d32",
@@ -91,12 +95,35 @@ def _clean(value: Any) -> Any:
     return value
 
 
-def _records(properties: Any) -> list[dict]:
-    """Turn a DataFrame / list[Property] / list[raw dict] into flat row dicts."""
+def _records(properties: Any, matcher=None) -> list[dict]:
+    """Turn a DataFrame / list[Property] / list[raw dict] into flat row dicts.
+
+    With a FeatureMatcher, each item is matched on its original form (so pydantic/raw inputs can
+    use feature details) and rows get matched_features / matched_keywords / feature_evidence
+    plus a private ``_passes`` flag.
+    """
     if properties is None:
         return []
+
+    def annotate(row: dict, item: Any) -> dict:
+        if matcher is not None and matcher.active:
+            passes, result = matcher.match(item)
+            row["matched_features"] = ", ".join(result.features) if passes and result.features else None
+            row["matched_keywords"] = ", ".join(result.keywords) if passes and result.keywords else None
+            row["feature_evidence"] = (
+                "; ".join(f"{k}: {v}" for k, v in result.evidence.items()) if passes and result.evidence else None
+            )
+            row["_passes"] = passes
+        else:
+            row["_passes"] = bool(row.get("matched_features") or row.get("matched_keywords"))
+        return row
+
     if isinstance(properties, pd.DataFrame):
-        return [{k: _clean(v) for k, v in row.items()} for row in properties.to_dict(orient="records")]
+        rows = []
+        for raw_row in properties.to_dict(orient="records"):
+            row = {k: _clean(v) for k, v in raw_row.items()}
+            rows.append(annotate(row, row))
+        return rows
 
     from .utils import process_result
     from .core.scrapers.models import Property
@@ -110,13 +137,50 @@ def _records(properties: Any) -> list[dict]:
             if prop is None:
                 continue
         elif isinstance(item, dict):
-            rows.append({k: _clean(v) for k, v in item.items()})
+            row = {k: _clean(v) for k, v in item.items()}
+            rows.append(annotate(row, row))
             continue
         else:
             raise TypeError(f"Unsupported property type: {type(item).__name__}")
         df = process_result(prop, _ALL_GROUPS)
-        rows.append({k: _clean(v) for k, v in df.iloc[0].to_dict().items()})
+        row = {k: _clean(v) for k, v in df.iloc[0].to_dict().items()}
+        rows.append(annotate(row, item))
     return rows
+
+
+def _haversine_miles(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
+    r = 3958.8
+    p1, p2 = math.radians(lat1), math.radians(lat2)
+    dp, dl = p2 - p1, math.radians(lon2 - lon1)
+    a = math.sin(dp / 2) ** 2 + math.cos(p1) * math.cos(p2) * math.sin(dl / 2) ** 2
+    return 2 * r * math.asin(min(1.0, math.sqrt(a)))
+
+
+class _GridIndex:
+    """Bucket points into ~radius-sized cells for fast "anything within X miles?" lookups."""
+
+    def __init__(self, radius_miles: float, ref_lat: float):
+        self.radius = radius_miles
+        self.dlat = radius_miles / 69.0
+        self.dlon = radius_miles / max(1e-6, 69.172 * math.cos(math.radians(ref_lat)))
+        self.cells: dict[tuple[int, int], list] = {}
+
+    def _cell(self, lat: float, lon: float) -> tuple[int, int]:
+        return int(math.floor(lat / self.dlat)), int(math.floor(lon / self.dlon))
+
+    def add(self, lat: float, lon: float, item: Any) -> None:
+        self.cells.setdefault(self._cell(lat, lon), []).append((lat, lon, item))
+
+    def nearest(self, lat: float, lon: float) -> tuple[float, Any] | None:
+        ci, cj = self._cell(lat, lon)
+        best = None
+        for di in (-1, 0, 1):
+            for dj in (-1, 0, 1):
+                for plat, plon, item in self.cells.get((ci + di, cj + dj), ()):
+                    distance = _haversine_miles(lat, lon, plat, plon)
+                    if distance <= self.radius and (best is None or distance < best[0]):
+                        best = (distance, item)
+        return best
 
 
 def _raw_to_property(raw: dict):
@@ -170,15 +234,27 @@ def _split(value: Any) -> list[str]:
     return [v.strip() for v in str(value).split(",") if v.strip()]
 
 
-def property_points(properties: Any) -> list[dict]:
+def property_points(properties: Any, *, features=None, nearby=None, keywords=None, match_mode: str = "any",
+                    only_matching: bool = False, near_matches_miles: float | None = None,
+                    highlight_color: str = HIGHLIGHT_COLOR) -> list[dict]:
     """Normalize properties into map points (one dict per property with valid coordinates).
 
+    :param features, nearby, keywords, match_mode: Highlight listings matching these (see
+        scrape_property). Without them, listings already annotated by scrape_property(features=...)
+        are highlighted.
+    :param only_matching: Keep only the matching listings.
+    :param near_matches_miles: Keep the matches plus listings within this many miles of a match
+        (e.g. homes near a cul-de-sac listing); each nearby point records its distance.
+
     Each point has: id, lat, lon, title, address, url, price, price_label, status, color,
-    facts (list of (label, value)), matched (features + keywords), evidence, photo,
-    google_maps_url, osm_url and the original flat ``row``.
+    status_color, is_match, matched (names), evidence, near_match_miles, facts (list of
+    (label, value)), summary, photo, google_maps_url, osm_url and the original flat ``row``.
     """
+    from .features import FeatureMatcher
+
+    matcher = FeatureMatcher(features, nearby, keywords, match_mode)
     points = []
-    for row in _records(properties):
+    for row in _records(properties, matcher):
         lat, lon = row.get("latitude"), row.get("longitude")
         try:
             lat, lon = float(lat), float(lon)
@@ -241,6 +317,8 @@ def property_points(properties: Any) -> list[dict]:
         facts = [(label, value) for label, value in facts if value not in (None, "", "nan")]
 
         maps_query = quote_plus(f"{lat},{lon}")
+        is_match = bool(row.pop("_passes", False))
+        status_color = STATUS_COLORS.get(status, DEFAULT_COLOR)
         points.append({
             "id": row.get("property_id"),
             "lat": lat,
@@ -251,7 +329,10 @@ def property_points(properties: Any) -> list[dict]:
             "price": price,
             "price_label": price_label,
             "status": status,
-            "color": STATUS_COLORS.get(status, DEFAULT_COLOR),
+            "color": highlight_color if is_match else status_color,
+            "status_color": status_color,
+            "is_match": is_match,
+            "near_match_miles": None,
             "facts": facts,
             "matched": _split(row.get("matched_features")) + _split(row.get("matched_keywords")),
             "evidence": row.get("feature_evidence"),
@@ -261,7 +342,36 @@ def property_points(properties: Any) -> list[dict]:
             "osm_url": f"https://www.openstreetmap.org/?mlat={lat}&mlon={lon}#map=18/{lat}/{lon}",
             "row": row,
         })
+
+    if only_matching:
+        return [p for p in points if p["is_match"]]
+    if near_matches_miles is not None:
+        return _keep_near_matches(points, float(near_matches_miles))
     return points
+
+
+def _keep_near_matches(points: list[dict], radius_miles: float) -> list[dict]:
+    matches = [p for p in points if p["is_match"]]
+    if not matches:
+        return []
+    index = _GridIndex(radius_miles, sum(p["lat"] for p in matches) / len(matches))
+    for match in matches:
+        index.add(match["lat"], match["lon"], match)
+
+    kept = []
+    for point in points:
+        if point["is_match"]:
+            kept.append(point)
+            continue
+        nearest = index.nearest(point["lat"], point["lon"])
+        if nearest is None:
+            continue
+        distance, match = nearest
+        point["near_match_miles"] = round(distance, 2)
+        label = ", ".join(m.replace("_", " ") for m in match["matched"]) or "match"
+        point["facts"].insert(0, ("Near match", f"{distance:.2f} mi from {match['address'] or match['title']} ({label})"))
+        kept.append(point)
+    return kept
 
 
 def _excerpt(text: Any, limit: int = 220) -> str | None:
@@ -344,24 +454,94 @@ def _write(path: str | os.PathLike | None, content: str, newline: str | None = N
         f.write(content)
 
 
-def _legend(points: list[dict]) -> list[dict]:
-    seen, legend = set(), []
+def _legend(points: list[dict], highlight_color: str = HIGHLIGHT_COLOR) -> list[dict]:
+    legend = []
+    if any(p["is_match"] for p in points):
+        legend.append({"label": "★ Matches", "color": highlight_color})
+    seen = set()
     for point in points:
         status = point["status"] or "OTHER"
         if status not in seen:
             seen.add(status)
-            legend.append({"label": status.replace("_", " ").title(), "color": point["color"]})
+            legend.append({"label": status.replace("_", " ").title(), "color": point["status_color"]})
+    if any(p["near_match_miles"] is not None for p in points):
+        legend.append({"label": "(non-matches shown are near a match)", "color": "transparent"})
     return legend
+
+
+def _match_options(kwargs: dict) -> dict:
+    """Pop the shared matching options from an exporter's kwargs."""
+    return {
+        key: kwargs.pop(key)
+        for key in ("features", "nearby", "keywords", "match_mode", "only_matching", "near_matches_miles",
+                    "highlight_color")
+        if key in kwargs
+    }
+
+
+# ---------------------------------------------------------------------------
+# Spatial clustering
+# ---------------------------------------------------------------------------
+
+def _cluster_ids(coords: list[tuple[float, float]], radius_miles: float) -> list[int]:
+    """Greedy leader clustering: each point joins the nearest cluster seed within radius_miles."""
+    if not coords:
+        return []
+    index = _GridIndex(radius_miles, sum(lat for lat, _ in coords) / len(coords))
+    ids, next_id = [], 1
+    for lat, lon in coords:
+        nearest = index.nearest(lat, lon)
+        if nearest is None:  # no seed within radius: this point seeds a new cluster
+            index.add(lat, lon, next_id)
+            ids.append(next_id)
+            next_id += 1
+        else:
+            ids.append(nearest[1])
+    return ids
+
+
+def cluster_properties(properties: Any, radius_miles: float = 0.5) -> pd.DataFrame:
+    """Group properties into spatial clusters (all members within ``radius_miles`` of the seed).
+
+    Returns a DataFrame (from scrape_property() or converted from models/raw dicts) with
+    cluster_id, cluster_size, cluster_center_lat and cluster_center_lon columns. Rows without
+    coordinates get no cluster.
+    """
+    if radius_miles <= 0:
+        raise ValueError("radius_miles must be positive")
+    df = properties.copy() if isinstance(properties, pd.DataFrame) else pd.DataFrame(
+        [{k: v for k, v in r.items() if k != "_passes"} for r in _records(properties)])
+    if df.empty:
+        for column in ("cluster_id", "cluster_size", "cluster_center_lat", "cluster_center_lon"):
+            df[column] = pd.Series(dtype="float64")
+        return df
+
+    lat = pd.to_numeric(df.get("latitude"), errors="coerce")
+    lon = pd.to_numeric(df.get("longitude"), errors="coerce")
+    valid = lat.notna() & lon.notna()
+    ids = _cluster_ids(list(zip(lat[valid], lon[valid])), radius_miles)
+
+    df["cluster_id"] = pd.Series(pd.NA, index=df.index, dtype="Int64")
+    df.loc[valid, "cluster_id"] = ids
+    groups = df.loc[valid].assign(_lat=lat[valid], _lon=lon[valid]).groupby("cluster_id")
+    df["cluster_size"] = df["cluster_id"].map(groups.size()).astype("Int64")
+    df["cluster_center_lat"] = df["cluster_id"].map(groups["_lat"].mean())
+    df["cluster_center_lon"] = df["cluster_id"].map(groups["_lon"].mean())
+    return df
 
 
 # ---------------------------------------------------------------------------
 # GeoJSON
 # ---------------------------------------------------------------------------
 
-def to_geojson(properties: Any, path: str | os.PathLike | None = None) -> dict:
-    """Export properties as a GeoJSON FeatureCollection (and write it to ``path`` if given)."""
+def to_geojson(properties: Any, path: str | os.PathLike | None = None, **match_options) -> dict:
+    """Export properties as a GeoJSON FeatureCollection (and write it to ``path`` if given).
+
+    Accepts the matching options of :func:`property_points` (features, nearby, keywords,
+    match_mode, only_matching, near_matches_miles); features get is_match / near_match_miles.
+    """
     features = []
-    for point in property_points(properties):
+    for point in property_points(properties, **_match_options(match_options)):
         props = {k: v for k, v in point["row"].items() if k not in ("latitude", "longitude")}
         props.update({
             "title": point["title"],
@@ -369,7 +549,9 @@ def to_geojson(properties: Any, path: str | os.PathLike | None = None) -> dict:
             "google_maps_url": point["google_maps_url"],
             "osm_url": point["osm_url"],
             "marker_color": point["color"],
+            "is_match": point["is_match"],
             "matched": point["matched"] or None,
+            "near_match_miles": point["near_match_miles"],
         })
         features.append({
             "type": "Feature",
@@ -377,10 +559,16 @@ def to_geojson(properties: Any, path: str | os.PathLike | None = None) -> dict:
             "geometry": {"type": "Point", "coordinates": [point["lon"], point["lat"]]},
             "properties": props,
         })
+    _reject_unknown(match_options, "to_geojson")
     collection = {"type": "FeatureCollection", "features": features}
     if path is not None:
         _write(path, json.dumps(collection, ensure_ascii=False, default=str, indent=2))
     return collection
+
+
+def _reject_unknown(kwargs: dict, func: str) -> None:
+    if kwargs:
+        raise TypeError(f"{func}() got unexpected keyword argument(s): {', '.join(sorted(kwargs))}")
 
 
 # ---------------------------------------------------------------------------
@@ -411,10 +599,13 @@ def _kml_placemark(point: dict, style_id: str) -> str:
         for key, label in _KML_FIELDS
         if point["row"].get(key) is not None
     )
+    if point["near_match_miles"] is not None:
+        extended += f'<Data name="Miles to nearest match"><value>{point["near_match_miles"]}</value></Data>'
     extended += f'<Data name="Google Maps"><value>{xml_escape(point["google_maps_url"])}</value></Data>'
+    name = ("★ " if point["is_match"] else "") + (point["title"] or "")
     return (
         "<Placemark>"
-        f"<name>{xml_escape(point['title'] or '')}</name>"
+        f"<name>{xml_escape(name)}</name>"
         f"<Snippet maxLines=\"1\">{xml_escape(point['address'] or '')}</Snippet>"
         f"<description><![CDATA[{cdata}]]></description>"
         f"<styleUrl>#{style_id}</styleUrl>"
@@ -432,25 +623,69 @@ def _kml_style(style_id: str, color: str, scale: float = 1.0, icon: str = "wht-b
     )
 
 
-def to_kml(properties: Any, path: str | os.PathLike | None = None, *, name: str = "HomeHarvest properties") -> str:
+KML_CLUSTER_BY = (None, "status", "match", "zip_code", "city", "county", "proximity")
+
+
+def to_kml(properties: Any, path: str | os.PathLike | None = None, *, name: str = "HomeHarvest properties",
+           cluster_by: str | None = "status", cluster_radius_miles: float = 0.5, **match_options) -> str:
     """Export properties as KML (Google Earth, Google My Maps, QGIS, ArcGIS...).
 
-    Placemarks are grouped in one folder per listing status. Each has an HTML balloon with the
-    listing details and a link to Realtor.com, plus the key fields as ExtendedData (shown as a
-    data table in Google My Maps).
+    Each placemark has an HTML balloon with the listing details and a link to Realtor.com, plus the
+    key fields as ExtendedData (shown as a data table in Google My Maps). Matches (see
+    ``features``/``nearby``/``keywords``) use a red star icon and a ★ in their name.
+
+    :param cluster_by: How placemarks are grouped into folders: "status" (default), "match"
+        (matches vs others), "zip_code", "city", "county", "proximity" (spatial clusters of
+        ``cluster_radius_miles``) or None (no folders). KML has no marker clustering of its own,
+        so folders are how Google Earth/My Maps users expand and collapse groups.
     """
-    points = property_points(properties)
-    styles = {}
-    folders: dict[str, list[str]] = {}
+    if cluster_by not in KML_CLUSTER_BY:
+        raise ValueError(f"cluster_by must be one of {KML_CLUSTER_BY}, got {cluster_by!r}")
+    options = _match_options(match_options)
+    _reject_unknown(match_options, "to_kml")
+    points = property_points(properties, **options)
+
+    styles = {"match": _kml_style("match", options.get("highlight_color", HIGHLIGHT_COLOR), 1.3, "red-stars")}
     for point in points:
         status = point["status"] or "OTHER"
         style_id = f"status-{status.lower()}"
-        styles.setdefault(style_id, _kml_style(style_id, point["color"]))
-        folders.setdefault(status.replace("_", " ").title(), []).append(_kml_placemark(point, style_id))
+        styles.setdefault(style_id, _kml_style(style_id, point["status_color"]))
 
+    def style_of(point):
+        return "match" if point["is_match"] else f"status-{(point['status'] or 'OTHER').lower()}"
+
+    if cluster_by == "proximity":
+        ids = _cluster_ids([(p["lat"], p["lon"]) for p in points], cluster_radius_miles)
+    folders: dict[str, list[str]] = {}
+    for i, point in enumerate(points):
+        if cluster_by is None:
+            folder = ""
+        elif cluster_by == "status":
+            folder = "★ Matches" if point["is_match"] else (point["status"] or "OTHER").replace("_", " ").title()
+        elif cluster_by == "match":
+            folder = "★ Matches" if point["is_match"] else "Other properties"
+        elif cluster_by == "proximity":
+            folder = f"Cluster {ids[i]}"
+        else:
+            folder = str(point["row"].get(cluster_by) or "Unknown")
+        folders.setdefault(folder, []).append(_kml_placemark(point, style_of(point)))
+
+    if cluster_by == "proximity":
+        def describe(folder: str, marks: list[str]) -> str:
+            members = [p for p, cid in zip(points, ids) if f"Cluster {cid}" == folder]
+            places = sorted({str(p["row"].get("city") or "") for p in members} - {""})
+            hits = sum(p["is_match"] for p in members)
+            return f"{folder} · {len(marks)} properties{' · ' + ', '.join(places) if places else ''}" + (
+                f" · {hits} ★" if hits else "")
+    else:
+        def describe(folder: str, marks: list[str]) -> str:
+            return f"{folder} ({len(marks)})"
+
+    ordered = sorted(folders.items(), key=lambda kv: (not kv[0].startswith("★"),)) if cluster_by else folders.items()
     body = "".join(
-        f"<Folder><name>{xml_escape(folder)} ({len(marks)})</name>{''.join(marks)}</Folder>"
-        for folder, marks in folders.items()
+        "".join(marks) if not folder else
+        f"<Folder><name>{xml_escape(describe(folder, marks))}</name>{''.join(marks)}</Folder>"
+        for folder, marks in ordered
     )
     kml = (
         '<?xml version="1.0" encoding="UTF-8"?>\n'
@@ -471,16 +706,20 @@ MY_MAPS_MAX_ROWS = 2000
 
 
 def to_google_my_maps_csv(properties: Any, path: str | os.PathLike | None = None,
-                          max_rows_per_file: int = MY_MAPS_MAX_ROWS) -> list[str]:
+                          max_rows_per_file: int = MY_MAPS_MAX_ROWS, **match_options) -> list[str]:
     """Export a CSV that Google My Maps can import (Create map -> Import).
 
     My Maps imports at most 2,000 rows per layer, so larger exports are split into
     ``name_part1.csv``, ``name_part2.csv``, ... Returns the CSV text(s); written to disk if ``path``.
+    In My Maps, use "Style by data column: Highlighted" to color the matches.
     """
+    options = _match_options(match_options)
+    _reject_unknown(match_options, "to_google_my_maps_csv")
     columns = ["Name", "Latitude", "Longitude", "Address", "Price", "Status", "Beds", "Baths", "Sqft",
-               "Lot acres", "Year built", "Matched", "Realtor.com link", "Google Maps link", "Description"]
+               "Lot acres", "Year built", "Highlighted", "Matched", "Miles to nearest match",
+               "Realtor.com link", "Google Maps link", "Description"]
     rows = []
-    for point in property_points(properties):
+    for point in property_points(properties, **options):
         row = point["row"]
         baths = dict(point["facts"]).get("Baths")
         lot = round(float(row["lot_sqft"]) / 43560, 2) if row.get("lot_sqft") else None
@@ -488,7 +727,8 @@ def to_google_my_maps_csv(properties: Any, path: str | os.PathLike | None = None
         rows.append([
             point["title"], point["lat"], point["lon"], point["address"], point["price_label"],
             point["status"], row.get("beds"), baths, row.get("sqft"), lot, row.get("year_built"),
-            ", ".join(point["matched"]) or None, point["url"], point["google_maps_url"], description,
+            "yes" if point["is_match"] else "no", ", ".join(point["matched"]) or None, point["near_match_miles"],
+            point["url"], point["google_maps_url"], description,
         ])
 
     chunks = [rows[i:i + max_rows_per_file] for i in range(0, len(rows), max_rows_per_file)] or [[]]
@@ -512,12 +752,16 @@ def to_google_my_maps_csv(properties: Any, path: str | os.PathLike | None = None
 # Interactive HTML maps
 # ---------------------------------------------------------------------------
 
+MARKERCLUSTER_VERSION = "1.5.3"
+GOOGLE_MARKERCLUSTERER_VERSION = "2.5.3"
+
+
 def _map_payload(points: list[dict]) -> list[dict]:
     return [
         {
             "lat": p["lat"], "lon": p["lon"], "title": p["title"] or "", "color": p["color"],
             "status": (p["status"] or "OTHER").replace("_", " ").title(),
-            "popup": _popup_html(p), "matched": bool(p["matched"]),
+            "popup": _popup_html(p), "is_match": p["is_match"],
         }
         for p in points
     ]
@@ -527,27 +771,52 @@ _PAGE_CSS = """
 html,body{margin:0;height:100%;background:#fff}
 #map{position:absolute;inset:0}
 .hh-legend{background:#fff;padding:8px 10px;border-radius:6px;box-shadow:0 1px 4px rgba(0,0,0,.3);
-  font:12px/1.5 system-ui,sans-serif;color:#222}
+  font:12px/1.5 system-ui,sans-serif;color:#222;max-width:260px}
 .hh-legend i{display:inline-block;width:10px;height:10px;border-radius:50%;margin-right:6px}
 .hh-title{font-weight:700;margin-bottom:4px}
-.hh-pin{width:14px;height:14px;border-radius:50%;border:2px solid #fff;box-shadow:0 0 3px rgba(0,0,0,.6)}
+.hh-pin{border-radius:50%;border:2px solid #fff;box-shadow:0 0 3px rgba(0,0,0,.6);box-sizing:border-box}
+.hh-pin.hh-hit{border-color:#fff;box-shadow:0 0 0 2px #d50000,0 0 6px rgba(0,0,0,.6)}
+.hh-cluster-hit{background:rgba(213,0,0,.25);border-radius:50%;width:40px;height:40px;display:flex;
+  align-items:center;justify-content:center}
+.hh-cluster-hit span{background:#d50000;color:#fff;border-radius:50%;width:30px;height:30px;display:flex;
+  align-items:center;justify-content:center;font:bold 12px system-ui,sans-serif}
 """
 
 
 def to_osm_map(properties: Any, path: str | os.PathLike | None = None, *, title: str = "HomeHarvest properties",
+               cluster: bool = True, cluster_radius: int = 60, disable_clustering_at_zoom: int | None = 17,
+               cluster_matches: bool = False,
                tiles: str = "https://tile.openstreetmap.org/{z}/{x}/{y}.png",
-               attribution: str = "&copy; <a href=\"https://www.openstreetmap.org/copyright\">OpenStreetMap</a> contributors") -> str:
+               attribution: str = "&copy; <a href=\"https://www.openstreetmap.org/copyright\">OpenStreetMap</a> contributors",
+               **match_options) -> str:
     """Interactive HTML map using Leaflet and OpenStreetMap tiles (no API key needed).
 
-    Open the file in any browser. Each marker's popup shows the listing details, photo and links
-    to Realtor.com, Google Maps and OpenStreetMap. Markers are colored by listing status and can
-    be toggled per status in the layer control.
+    :param cluster: Group nearby markers into clusters that split apart as you zoom in.
+    :param cluster_radius: Max cluster radius in pixels (smaller = more, tighter clusters).
+    :param disable_clustering_at_zoom: Show every marker from this zoom level on (None = always cluster).
+    :param cluster_matches: Also cluster the highlighted matches (default: always show them).
+    :param features, nearby, keywords, match_mode, only_matching, near_matches_miles: Highlight
+        matching listings in red (own "★ Matches" layer); see :func:`property_points`.
+
+    Each popup shows the listing details, photo and links to Realtor.com, Google Maps and
+    OpenStreetMap. Layers can be toggled per status in the layer control.
     """
-    points = property_points(properties)
+    options = _match_options(match_options)
+    _reject_unknown(match_options, "to_osm_map")
+    points = property_points(properties, **options)
     config = {
-        "title": title, "tiles": tiles, "attribution": attribution,
-        "legend": _legend(points),
+        "title": title, "tiles": tiles, "attribution": attribution, "legend": _legend(points),
+        "cluster": bool(cluster), "clusterRadius": int(cluster_radius),
+        "disableAt": disable_clustering_at_zoom, "clusterMatches": bool(cluster_matches),
     }
+    cluster_assets = ""
+    if cluster:
+        base = f"https://unpkg.com/leaflet.markercluster@{MARKERCLUSTER_VERSION}/dist"
+        cluster_assets = (
+            f'<link rel="stylesheet" href="{base}/MarkerCluster.css" crossorigin="">\n'
+            f'<link rel="stylesheet" href="{base}/MarkerCluster.Default.css" crossorigin="">\n'
+            f'<script src="{base}/leaflet.markercluster.js" crossorigin=""></script>'
+        )
     page = f"""<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -560,40 +829,78 @@ def to_osm_map(properties: Any, path: str | os.PathLike | None = None, *, title:
 <body>
 <div id="map"></div>
 <script src="https://unpkg.com/leaflet@{LEAFLET_VERSION}/dist/leaflet.js" crossorigin=""></script>
+{cluster_assets}
 <script>
 const POINTS = {_json_for_script(_map_payload(points))};
 const CONFIG = {_json_for_script(config)};
+const MATCHES = '★ Matches';
 const map = L.map('map');
 L.tileLayer(CONFIG.tiles, {{maxZoom: 19, attribution: CONFIG.attribution}}).addTo(map);
 
-function pin(color, big) {{
-  const size = big ? 20 : 14;
+function pin(color, hit) {{
+  const size = hit ? 20 : 14;
   return L.divIcon({{
     className: '', iconSize: [size, size], iconAnchor: [size / 2, size / 2], popupAnchor: [0, -size / 2],
-    html: '<div class="hh-pin" style="width:' + size + 'px;height:' + size + 'px;background:' + color + '"></div>'
+    html: '<div class="hh-pin' + (hit ? ' hh-hit' : '') + '" style="width:' + size + 'px;height:' + size +
+          'px;background:' + color + '"></div>'
   }});
 }}
 
-const layers = {{}};
+function clusterGroup(hit) {{
+  const options = {{maxClusterRadius: CONFIG.clusterRadius, showCoverageOnHover: false, chunkedLoading: true}};
+  if (CONFIG.disableAt !== null) options.disableClusteringAtZoom = CONFIG.disableAt;
+  if (hit) options.iconCreateFunction = c => L.divIcon({{
+    className: '', iconSize: [40, 40],
+    html: '<div class="hh-cluster-hit"><span>' + c.getChildCount() + '</span></div>'}});
+  return L.markerClusterGroup(options);
+}}
+
+// One marker list per layer name (matches first, then each status)
+const groups = {{}};
 const bounds = [];
 for (const p of POINTS) {{
-  const marker = L.marker([p.lat, p.lon], {{icon: pin(p.color, p.matched), title: p.title}})
+  const name = p.is_match ? MATCHES : p.status;
+  const marker = L.marker([p.lat, p.lon], {{icon: pin(p.color, p.is_match), title: p.title,
+                                            zIndexOffset: p.is_match ? 1000 : 0}})
     .bindPopup(p.popup, {{maxWidth: 320}});
-  (layers[p.status] = layers[p.status] || L.layerGroup().addTo(map)).addLayer(marker);
+  (groups[name] = groups[name] || []).push(marker);
   bounds.push([p.lat, p.lon]);
 }}
 
-L.control.layers(null, Object.fromEntries(
-  Object.entries(layers).map(([name, layer]) => [name + ' (' + layer.getLayers().length + ')', layer])
-), {{collapsed: false}}).addTo(map);
+const shared = CONFIG.cluster ? clusterGroup(false).addTo(map) : null;
+const matchCluster = CONFIG.cluster && CONFIG.clusterMatches ? clusterGroup(true).addTo(map) : null;
+
+function toggle(target, markers) {{
+  // An empty layer whose visibility adds/removes its markers from a shared cluster group
+  const layer = L.layerGroup();
+  layer.on('add', () => target.addLayers(markers));
+  layer.on('remove', () => target.removeLayers(markers));
+  return layer;
+}}
+
+const overlays = {{}};
+const names = Object.keys(groups).sort((a, b) => (b === MATCHES) - (a === MATCHES));
+for (const name of names) {{
+  const markers = groups[name];
+  let layer;
+  if (name === MATCHES) layer = matchCluster ? toggle(matchCluster, markers) : L.layerGroup(markers);
+  else layer = shared ? toggle(shared, markers) : L.layerGroup(markers);
+  layer.addTo(map);
+  overlays[name + ' (' + markers.length + ')'] = layer;
+}}
+L.control.layers(null, overlays, {{collapsed: false}}).addTo(map);
 
 const legend = L.control({{position: 'bottomleft'}});
 legend.onAdd = () => {{
   const div = L.DomUtil.create('div', 'hh-legend');
-  div.innerHTML = '<div class="hh-title"></div>' + CONFIG.legend.map(
-    l => '<div><i style="background:' + l.color + '"></i><span></span></div>').join('');
-  div.querySelector('.hh-title').textContent = CONFIG.title + ' (' + POINTS.length + ')';
-  div.querySelectorAll('span').forEach((s, i) => s.textContent = CONFIG.legend[i].label);
+  const head = L.DomUtil.create('div', 'hh-title', div);
+  head.textContent = CONFIG.title + ' (' + POINTS.length + ')';
+  for (const l of CONFIG.legend) {{
+    const row = L.DomUtil.create('div', '', div);
+    const dot = L.DomUtil.create('i', '', row);
+    dot.style.background = l.color;
+    row.appendChild(document.createTextNode(l.label));
+  }}
   return div;
 }};
 legend.addTo(map);
@@ -609,20 +916,31 @@ else {{ map.setView([39.5, -98.35], 4); }}
 
 
 def to_google_maps(properties: Any, path: str | os.PathLike | None = None, *, api_key: str,
-                   title: str = "HomeHarvest properties") -> str:
+                   title: str = "HomeHarvest properties", cluster: bool = True, cluster_matches: bool = False,
+                   **match_options) -> str:
     """Interactive HTML map using the Google Maps JavaScript API.
 
     Requires a Google Maps JavaScript API key (https://developers.google.com/maps/documentation/javascript/get-api-key).
     Without a key, use :func:`to_kml` or :func:`to_google_my_maps_csv` and import the file into
     Google My Maps (mymaps.google.com) - every point also links to Google Maps.
+
+    :param cluster: Cluster markers with @googlemaps/markerclusterer.
+    :param cluster_matches: Also cluster the highlighted matches (default: always show them).
     """
     if not api_key:
         raise ValueError(
             "to_google_maps() needs a Google Maps JavaScript API key. Without one, export with "
             "to_kml() or to_google_my_maps_csv() and import the file into Google My Maps."
         )
-    points = property_points(properties)
-    config = {"title": title, "legend": _legend(points)}
+    options = _match_options(match_options)
+    _reject_unknown(match_options, "to_google_maps")
+    points = property_points(properties, **options)
+    config = {"title": title, "legend": _legend(points), "cluster": bool(cluster),
+              "clusterMatches": bool(cluster_matches)}
+    clusterer = (
+        f'<script src="https://unpkg.com/@googlemaps/markerclusterer@{GOOGLE_MARKERCLUSTERER_VERSION}'
+        f'/dist/index.min.js" crossorigin=""></script>' if cluster else ""
+    )
     page = f"""<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -633,6 +951,7 @@ def to_google_maps(properties: Any, path: str | os.PathLike | None = None, *, ap
 </head>
 <body>
 <div id="map"></div>
+{clusterer}
 <script>
 const POINTS = {_json_for_script(_map_payload(points))};
 const CONFIG = {_json_for_script(config)};
@@ -641,18 +960,23 @@ function initMap() {{
     center: {{lat: 39.5, lng: -98.35}}, zoom: 4, mapTypeControl: true, streetViewControl: true}});
   const info = new google.maps.InfoWindow();
   const bounds = new google.maps.LatLngBounds();
-  const markers = POINTS.map(p => {{
+  const plain = [], hits = [];
+  for (const p of POINTS) {{
     const marker = new google.maps.Marker({{
-      position: {{lat: p.lat, lng: p.lon}}, title: p.title,
-      icon: {{path: google.maps.SymbolPath.CIRCLE, scale: p.matched ? 9 : 6, fillColor: p.color,
+      position: {{lat: p.lat, lng: p.lon}}, title: p.title, zIndex: p.is_match ? 1000 : 1,
+      icon: {{path: google.maps.SymbolPath.CIRCLE, scale: p.is_match ? 9 : 6, fillColor: p.color,
               fillOpacity: 1, strokeColor: '#fff', strokeWeight: 2}}
     }});
     marker.addListener('click', () => {{ info.setContent(p.popup); info.open({{map, anchor: marker}}); }});
     bounds.extend(marker.getPosition());
-    return marker;
-  }});
-  markers.forEach(m => m.setMap(map));
-  if (markers.length) map.fitBounds(bounds);
+    (p.is_match ? hits : plain).push(marker);
+  }}
+  const canCluster = CONFIG.cluster && window.markerClusterer;
+  if (canCluster) new markerClusterer.MarkerClusterer({{map, markers: plain}});
+  else plain.forEach(m => m.setMap(map));
+  if (canCluster && CONFIG.clusterMatches) new markerClusterer.MarkerClusterer({{map, markers: hits}});
+  else hits.forEach(m => m.setMap(map));
+  if (POINTS.length) map.fitBounds(bounds);
 
   const legend = document.createElement('div');
   legend.className = 'hh-legend';
@@ -681,7 +1005,7 @@ function initMap() {{
 
 
 # ---------------------------------------------------------------------------
-# Dispatcher
+# Dispatcher + one-call scrape & map
 # ---------------------------------------------------------------------------
 
 _FORMATS = {
@@ -693,7 +1017,8 @@ def export_map(properties: Any, path: str | os.PathLike, format: str | None = No
     """Export to a map file, choosing the format from ``format`` or the file extension.
 
     Formats: ``osm`` (.html), ``google`` (.html, needs ``api_key=``), ``kml`` (.kml),
-    ``geojson`` (.geojson/.json), ``my_maps_csv`` (.csv). Returns the path written.
+    ``geojson`` (.geojson/.json), ``my_maps_csv`` (.csv). Extra keyword arguments go to the
+    exporter (e.g. cluster=True, features=["cul_de_sac"], near_matches_miles=0.5). Returns the path.
     """
     fmt = (format or _FORMATS.get(os.path.splitext(os.fspath(path))[1].lower()) or "").lower()
     if fmt in ("osm", "openstreetmap", "leaflet", "html"):
@@ -712,3 +1037,41 @@ def export_map(properties: Any, path: str | os.PathLike, format: str | None = No
             "Use one of: osm (.html), google, kml (.kml), geojson (.geojson), my_maps_csv (.csv)."
         )
     return os.fspath(path)
+
+
+_MAP_ONLY_OPTIONS = ("title", "cluster", "cluster_radius", "disable_clustering_at_zoom", "cluster_matches",
+                     "tiles", "attribution", "api_key", "name", "cluster_by", "cluster_radius_miles",
+                     "max_rows_per_file", "highlight_color")
+
+
+def generate_map(location: str, path: str | os.PathLike, *, format: str | None = None,
+                 features=None, nearby=None, keywords=None, match_mode: str = "any",
+                 only_matching: bool = False, near_matches_miles: float | None = None,
+                 cluster: bool = True, title: str | None = None, **kwargs) -> pd.DataFrame:
+    """Scrape a location and write a map in one call. Returns the scraped DataFrame.
+
+    Every listing is fetched and the ones matching ``features`` / ``nearby`` / ``keywords`` are
+    highlighted (``only_matching=True`` drops the rest; ``near_matches_miles=0.5`` keeps the
+    matches plus listings within half a mile of one). Other keyword arguments go to
+    :func:`homeharvest.scrape_property` (listing_type, property_type, past_days,
+    include_environmental_risk, ...) or to the exporter (cluster_radius, api_key, cluster_by, ...).
+
+        >>> generate_map("Lehigh Acres, FL", "lehigh.html", property_type=["land"],
+        ...              features=["cul_de_sac"], near_matches_miles=0.25)
+    """
+    from . import scrape_property
+
+    map_kwargs = {k: kwargs.pop(k) for k in list(kwargs) if k in _MAP_ONLY_OPTIONS}
+    fmt = (format or _FORMATS.get(os.path.splitext(os.fspath(path))[1].lower()) or "").lower()
+    if fmt in ("osm", "openstreetmap", "leaflet", "html", "google", "google_maps"):
+        map_kwargs["cluster"] = cluster
+
+    # With only_matching, filter during the scrape; otherwise fetch everything and highlight on the map.
+    scrape_filters = dict(features=features, nearby=nearby, keywords=keywords, match_mode=match_mode)
+    df = scrape_property(location=location, **(scrape_filters if only_matching else {}), **kwargs)
+
+    if fmt not in ("my_maps_csv", "csv", "google_my_maps", "geojson"):
+        map_kwargs.setdefault("title" if fmt != "kml" else "name", title or f"{location} ({len(df)} properties)")
+    export_map(df, path, format=format, **scrape_filters, only_matching=only_matching,
+               near_matches_miles=near_matches_miles, **map_kwargs)
+    return df
