@@ -173,7 +173,10 @@ class FakeRealtorAPI:
         self.calls.append((operation_name, query, deepcopy(variables)))
 
         if operation_name == "Search_suggestions":
-            return {"data": {"search_suggestions": {"geo_results": [self.location]}}}
+            location = self.location
+            if callable(location):
+                location = location(variables["searchInput"]["search_term"])
+            return {"data": {"search_suggestions": {"geo_results": [location]}}}
 
         # Validate everything else against the bundled schema
         errors = validate_query(query)
@@ -198,6 +201,9 @@ class FakeRealtorAPI:
             return {"data": {f"home_{pid}": deepcopy(self.details.get(pid)) for pid in ids}}
 
         if operation_name == "GetLocationAggregates":
-            return {"data": {"home_search": {"total": 1, "aggregation": deepcopy(self.aggregation)}}}
+            aggregation = self.aggregation
+            if callable(aggregation):
+                aggregation = aggregation(variables["search_location"]["location"], query)
+            return {"data": {"home_search": {"total": 1, "aggregation": deepcopy(aggregation)}}}
 
         raise AssertionError(f"Unexpected operation {operation_name}")

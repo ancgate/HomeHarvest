@@ -10,6 +10,9 @@ from .utils import (
 from .core.scrapers.realtor import RealtorScraper
 from .features import FeatureMatcher, filter_properties, list_features, match_property, register_feature, FeatureDefinition
 from .maps import to_osm_map, to_google_maps, to_kml, to_google_my_maps_csv, to_geojson, export_map
+from .locations import (
+    get_states, get_state, get_counties, get_cities, get_zip_codes, get_location_hierarchy, aggregate_locations
+)
 from .core.scrapers.models import ListingType, SearchPropertyType, ReturnType, Property
 from typing import Union, Optional, List
 

@@ -38,6 +38,7 @@ from .queries import (
     DETAIL_INSURANCE_FIELDS,
     DETAIL_MARKET_STATS_FIELDS,
     build_property_details_query,
+    build_location_aggregates_query,
 )
 from .processors import (
     process_property,
@@ -783,6 +784,34 @@ class RealtorScraper(Scraper):
             for key, value in data["data"].items()
             if key.startswith("home_") and value
         }
+
+    # ------------------------------------------------------------------
+    # Location aggregates (counties / cities / ZIP codes with listing counts)
+    # ------------------------------------------------------------------
+
+    def get_location_aggregates(self, fields: list[str], size: int = 2000) -> dict | None:
+        """Return Realtor.com's raw ``aggregation`` JSON for the resolved location, or None.
+
+        Statuses follow this scraper's listing_type (None -> for_sale, for_rent, sold, off_market).
+        """
+        location_info = self._get_location_info()
+        if not location_info or not location_info.get("text"):
+            return None
+
+        if self.listing_type is None:
+            statuses = ["for_sale", "for_rent", "sold", "off_market"]
+        else:
+            types = self.listing_type if isinstance(self.listing_type, list) else [self.listing_type]
+            statuses = []
+            for listing_type in types:
+                value = "for_sale" if listing_type == ListingType.PENDING else listing_type.value.lower()
+                if value not in statuses:
+                    statuses.append(value)
+
+        query = build_location_aggregates_query(fields, statuses, size)
+        variables = {"search_location": {"location": location_info["text"]}}
+        data = self._graphql_post(query, variables, "GetLocationAggregates")
+        return (((data or {}).get("data") or {}).get("home_search") or {}).get("aggregation")
 
     # ------------------------------------------------------------------
     # Core search (single listing type or a combination without date filters)

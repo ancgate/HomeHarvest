@@ -892,3 +892,20 @@ def build_property_details_query(property_ids: list[str], selections: list[str])
         for pid in property_ids
     )
     return "query GetPropertyDetails { %s }" % homes
+
+
+#: Realtor.com aggregations used by homeharvest.locations (county / city / postal_code lists)
+LOCATION_AGGREGATE_FIELDS = ("county", "city", "postal_code")
+
+
+def build_location_aggregates_query(fields: list[str], statuses: list[str], size: int) -> str:
+    for field in fields:
+        if field not in LOCATION_AGGREGATE_FIELDS:
+            raise ValueError(f"Unsupported aggregate field {field!r}")
+    status_param = f"status: [{', '.join(statuses)}]" if statuses else ""
+    return (
+        "query GetLocationAggregates($search_location: SearchLocation) { "
+        "home_search(query: { search_location: $search_location %s } limit: 1 "
+        "aggregate: { field: [%s], size: %d }) { total aggregation } }"
+        % (status_param, ", ".join(fields), int(size))
+    )
