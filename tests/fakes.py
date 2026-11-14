@@ -142,6 +142,7 @@ class FakeRealtorAPI:
         self.details = details or {}
         self.details_error = details_error
         self.aggregation = aggregation
+        self.cap = None  #: emulate Realtor.com's per-search result cap (None = unlimited)
         self.calls: list[tuple[str, str, dict]] = []
         self.schema_errors: list[str] = []
 
@@ -156,14 +157,37 @@ class FakeRealtorAPI:
             return []
         return [s.strip() for s in match.group(1).split(",") if s.strip()]
 
+    @staticmethod
+    def _range(query: str, field: str, quoted: bool):
+        value = r'"([^"]+)"' if quoted else r"([0-9.eE+]+)"
+        block = re.search(field + r":\s*\{([^}]*)\}", query)
+        if not block:
+            return None, None
+        low = re.search(r"min:\s*" + value, block.group(1))
+        high = re.search(r"max:\s*" + value, block.group(1))
+        cast = (lambda v: v) if quoted else float
+        return (cast(low.group(1)) if low else None), (cast(high.group(1)) if high else None)
+
     def _search_results(self, query: str) -> list[dict]:
         statuses = self._statuses(query)
         pending_only = "or_filters" in query and "pending: true" in query
+        price_low, price_high = self._range(query, "list_price", quoted=False)
+        sold_low, sold_high = self._range(query, "sold_date", quoted=True)
         results = []
         for home in self.homes:
             if statuses and home["status"] not in statuses:
                 continue
             if pending_only and not (home["flags"]["is_pending"] or home["flags"]["is_contingent"]):
+                continue
+            price = home["list_price"]
+            if price_low is not None and (price is None or price < price_low):
+                continue
+            if price_high is not None and (price is None or price > price_high):
+                continue
+            sold = (home["last_sold_date"] or "")[:10]
+            if sold_low is not None and not (sold and sold >= sold_low[:10]):
+                continue
+            if sold_high is not None and not (sold and sold <= sold_high[:10]):
                 continue
             results.append(deepcopy(home))
         return results
@@ -185,7 +209,8 @@ class FakeRealtorAPI:
         if operation_name == "GetHomeSearch":
             results = self._search_results(query)
             offset = variables.get("offset", 0)
-            page = results[offset:offset + 200]
+            end = offset + 200 if self.cap is None else min(offset + 200, self.cap)
+            page = results[offset:end]
             return {"data": {"homeSearch": {"__typename": "SearchHomeResult", "count": len(page),
                                             "total": len(results), "results": page}}}
 

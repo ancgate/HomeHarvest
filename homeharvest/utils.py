@@ -371,11 +371,10 @@ def validate_dates(date_from: str | None, date_to: str | None) -> None:
         )
 
 
-def validate_limit(limit: int) -> None:
-    #: 1 -> 10000 limit
-
-    if limit is not None and (limit < 1 or limit > 10000):
-        raise ValueError("Property limit must be between 1 and 10,000.")
+def validate_limit(limit: int | None) -> None:
+    #: None = no limit; above 10,000 the search is split automatically (see RealtorScraper._search_past_cap)
+    if limit is not None and limit < 1:
+        raise ValueError("Property limit must be at least 1 (or None for no limit).")
 
 
 def validate_offset(offset: int, limit: int = 10000) -> None:
@@ -391,12 +390,12 @@ def validate_offset(offset: int, limit: int = 10000) -> None:
     if offset is not None and offset < 0:
         raise ValueError("Offset must be non-negative (>= 0).")
 
-    # Check if offset + limit exceeds API's hard limit of 10,000
-    if offset is not None and limit is not None and (offset + limit) > 10000:
+    # offset pages within one search window of 10,000; past that the search is split automatically
+    if offset and (limit is None or offset + limit > 10000):
         raise ValueError(
-            f"offset ({offset}) + limit ({limit}) = {offset + limit} exceeds API maximum of 10,000. "
-            f"The API cannot return results beyond position 10,000. "
-            f"To fetch more results, narrow your search."
+            f"offset ({offset}) + limit ({limit}) goes past the API maximum of 10,000. "
+            "Use offset=0 with limit=None (or a limit above 10,000): larger searches are split "
+            "automatically by listing type, price and sold date."
         )
 
     # Warn if offset is not a multiple of 200 (API page size)

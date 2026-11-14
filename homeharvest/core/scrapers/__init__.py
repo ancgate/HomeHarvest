@@ -45,7 +45,7 @@ class ScraperInput(BaseModel):
     foreclosure: bool | None = False
     extra_property_data: bool | None = True
     exclude_pending: bool | None = False
-    limit: int = 10000
+    limit: int | None = 10000
     offset: int = 0
     return_type: ReturnType = ReturnType.pandas
 

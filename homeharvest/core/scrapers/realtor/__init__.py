@@ -11,6 +11,7 @@ import copy
 import json
 import re
 import warnings
+from datetime import date, datetime, timedelta, timezone
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from json import JSONDecodeError
 from typing import Dict, Union
@@ -75,6 +76,15 @@ class RealtorScraper(Scraper):
     DETAIL_WORKERS = 4
     PAGE_WORKERS = 4
 
+    #: Realtor.com returns at most this many results per search (offset + page <= cap)
+    API_RESULT_CAP = 10000
+    #: Price band edges used to split a large for-sale/for-rent search (last band is open-ended)
+    PRICE_BAND_EDGES = (0, 50_000, 100_000, 250_000, 500_000, 1_000_000, 2_500_000, 5_000_000)
+    #: Earliest sold date used when splitting a sold search that has no date filter
+    SOLD_DATE_FLOOR = date(1990, 1, 1)
+    #: Listing types that can be split by list price (sold uses sold date; off-market can't be split)
+    PRICE_SPLITTABLE = ("FOR_SALE", "FOR_RENT", "PENDING", "NEW_COMMUNITY", "READY_TO_BUILD", "OTHER")
+
     #: Listing types searched when a date filter is combined with listing_type=None.
     #: Each has a meaningful date field (list_date, sold_date, pending_date).
     DATE_FILTER_DEFAULT_LISTING_TYPES = [
@@ -88,6 +98,8 @@ class RealtorScraper(Scraper):
         super().__init__(scraper_input)
         self._location_info = None
         self._location_resolved = False
+        self._band = None          #: (low, high) price or sold-date band of a split sub-search
+        self._no_split = False     #: set when a piece can't be split any further
         #: shared by copies made for sub-searches, so they share retries, sessions and block detection
         self.client = PoliteClient(
             base_url=self.SEARCH_GQL_URL,
@@ -551,7 +563,7 @@ class RealtorScraper(Scraper):
 
         #: limit the number of properties to be processed
         #: example, if your offset is 200, and your limit is 250, return 50
-        properties_list: list[dict] = properties_list[: self.limit - offset]
+        properties_list: list[dict] = properties_list[: self._window_end() - offset]
 
         if self.extra_property_data:
             property_ids = [data["property_id"] for data in properties_list]
@@ -625,11 +637,13 @@ class RealtorScraper(Scraper):
             return True
         return isinstance(self.listing_type, list) and len(self.listing_type) > 1
 
-    def _search_split_listing_types(self):
+    def _search_split_listing_types(self, default_types=None):
         listing_types = (
-            self.listing_type if isinstance(self.listing_type, list) else self.DATE_FILTER_DEFAULT_LISTING_TYPES
+            self.listing_type if isinstance(self.listing_type, list)
+            else default_types or self.DATE_FILTER_DEFAULT_LISTING_TYPES
         )
-        window = min(10000, self.offset + self.limit)
+        #: each type may itself go past the API cap (it is split further in its own _search_core)
+        window = None if self.limit is None else self.offset + self.limit
         self._get_location_info()  #: resolve once; the copies below share the cached result
 
         merged, seen = [], set()
@@ -653,7 +667,7 @@ class RealtorScraper(Scraper):
         if self.sort_by:
             merged = self._apply_sort(merged)
 
-        return merged[self.offset:self.offset + self.limit]
+        return merged[self.offset:] if self.limit is None else merged[self.offset:self.offset + self.limit]
 
     # ------------------------------------------------------------------
     # Client-side post filters
@@ -827,6 +841,121 @@ class RealtorScraper(Scraper):
         return (((data or {}).get("data") or {}).get("home_search") or {}).get("aggregation")
 
     # ------------------------------------------------------------------
+    # Splitting searches past the API result cap
+    # ------------------------------------------------------------------
+
+    def _window_end(self) -> int:
+        """Last result position one search may page to: offset + limit, at most the API cap."""
+        if self.limit is None:
+            return self.API_RESULT_CAP
+        return min(self.API_RESULT_CAP, self.offset + self.limit)
+
+    def _needs_cap_split(self, total: int, search_type: str) -> bool:
+        wants_more = self.limit is None or self.offset + self.limit > self.API_RESULT_CAP
+        return search_type in ("area", "comps") and total > self.API_RESULT_CAP and wants_more and not self._no_split
+
+    def _split_dimension(self) -> str | None:
+        if self.listing_type == ListingType.SOLD:
+            return "sold_date"
+        if isinstance(self.listing_type, ListingType) and self.listing_type.name in self.PRICE_SPLITTABLE:
+            return "price"
+        return None
+
+    def _child_bands(self, dimension: str) -> list[tuple] | None:
+        """Bands to search instead of this one, or None if it can't be split further."""
+        if dimension == "price":
+            if self._band is None:
+                low = float(self.price_min or 0)
+                high = float(self.price_max) if self.price_max is not None else None
+                edges = sorted({low} | {float(e) for e in self.PRICE_BAND_EDGES
+                                        if e > low and (high is None or e <= high)})
+                bands = [(a, round(b - 0.01, 2)) for a, b in zip(edges, edges[1:])] + [(edges[-1], high)]
+                return bands if len(bands) > 1 else self._halve_price(low, high)
+            return self._halve_price(*self._band)
+
+        # sold_date: newest band first, like Realtor.com's default sold sort
+        if self._band is None:
+            start, end = self._sold_date_range()
+        else:
+            start, end = self._band
+        if (end - start).days < 1:
+            return None
+        middle = start + (end - start) // 2
+        return [(middle + timedelta(days=1), end), (start, middle)]
+
+    @staticmethod
+    def _halve_price(low: float, high: float | None) -> list[tuple] | None:
+        if high is None:  # open-ended band: double the floor
+            split = max(low * 2, 100_000.0)
+            return [(low, round(split - 0.01, 2)), (split, None)]
+        if high - low < 1:
+            return None
+        middle = round((low + high) / 2, 2)
+        return [(low, middle), (round(middle + 0.01, 2), high)]
+
+    def _sold_date_range(self) -> tuple[date, date]:
+        today = datetime.now(timezone.utc).date()
+        if self.date_from or self.date_to:
+            start = datetime.fromisoformat(self.date_from.replace("Z", "+00:00")).date() if self.date_from \
+                else self.SOLD_DATE_FLOOR
+            end = datetime.fromisoformat(self.date_to.replace("Z", "+00:00")).date() if self.date_to else today
+            return start, end
+        if self.last_x_days:
+            return today - timedelta(days=self.last_x_days), today
+        if self.past_hours:
+            return today - timedelta(days=int(self.past_hours / 24) + 1), today
+        return self.SOLD_DATE_FLOOR, today
+
+    def _band_scraper(self, dimension: str, band: tuple, remaining: int | None):
+        sub = copy.copy(self)
+        sub._band = band
+        sub.offset = 0
+        sub.limit = remaining
+        if dimension == "price":
+            sub.price_min, sub.price_max = band
+        else:
+            sub.date_from, sub.date_to = band[0].isoformat(), band[1].isoformat()
+            sub.date_from_precision = sub.date_to_precision = "day"
+            sub.last_x_days = None
+            sub.past_hours = None  #: the hour-precision filter is re-applied by the parent (_finalize)
+        return sub
+
+    def _search_past_cap(self, total: int):
+        """Collect more than API_RESULT_CAP results by splitting into smaller searches."""
+        if self.listing_type is None or isinstance(self.listing_type, list):
+            types = None if self.listing_type is not None else [
+                ListingType.FOR_SALE, ListingType.FOR_RENT, ListingType.SOLD, ListingType.OFF_MARKET]
+            return self._finalize(self._search_split_listing_types(default_types=types))
+
+        dimension = self._split_dimension()
+        bands = self._child_bands(dimension) if dimension else None
+        if not bands:
+            what = (f"{self.listing_type.value.lower()} listings can't be split further"
+                    if dimension is None else f"a {dimension.replace('_', ' ')} band of {self._band} can't be split")
+            warnings.warn(
+                f"{total:,} matching listings but Realtor.com returns at most {self.API_RESULT_CAP:,} per search and "
+                f"{what}; only the first {self.API_RESULT_CAP:,} are returned. Narrow the search to get the rest.",
+                RuntimeWarning, stacklevel=2,
+            )
+            capped = copy.copy(self)
+            capped._no_split = True
+            return capped._search_core()
+
+        merged, seen = [], set()
+        limit = None if self.limit is None else self.offset + self.limit
+        for band in bands:
+            remaining = None if limit is None else limit - len(merged)
+            if remaining is not None and remaining <= 0:
+                break
+            for home in self._band_scraper(dimension, band, remaining)._search_core():
+                property_id = home.get("property_id") if isinstance(home, dict) else home.property_id
+                if property_id not in seen:
+                    seen.add(property_id)
+                    merged.append(home)
+        merged = self._finalize(merged)
+        return merged if limit is None else merged[:limit]
+
+    # ------------------------------------------------------------------
     # Core search (single listing type or a combination without date filters)
     # ------------------------------------------------------------------
 
@@ -874,8 +1003,12 @@ class RealtorScraper(Scraper):
         total = result["total"]
         homes = result["properties"]
 
+        if self._needs_cap_split(total, search_type):
+            #: more matches than Realtor.com will page through: split into smaller searches
+            return self._search_past_cap(total)
+
         # Fetch remaining pages based on parallel parameter
-        if self.offset + self.DEFAULT_PAGE_SIZE < min(total, self.offset + self.limit):
+        if self.offset + self.DEFAULT_PAGE_SIZE < min(total, self._window_end()):
             if self.parallel:
                 # Parallel mode: Fetch all remaining pages in parallel
                 with ThreadPoolExecutor(max_workers=self.PAGE_WORKERS) as executor:
@@ -887,7 +1020,7 @@ class RealtorScraper(Scraper):
                         ))
                         for i in range(
                             self.offset + self.DEFAULT_PAGE_SIZE,
-                            min(total, self.offset + self.limit),
+                            min(total, self._window_end()),
                             self.DEFAULT_PAGE_SIZE,
                         )
                     ]
@@ -904,7 +1037,7 @@ class RealtorScraper(Scraper):
                 # Sequential mode: Fetch pages one by one with early termination checks
                 for current_offset in range(
                     self.offset + self.DEFAULT_PAGE_SIZE,
-                    min(total, self.offset + self.limit),
+                    min(total, self._window_end()),
                     self.DEFAULT_PAGE_SIZE,
                 ):
                     # Check if we should continue based on time-based filters
@@ -918,6 +1051,10 @@ class RealtorScraper(Scraper):
                     page_properties = result["properties"]
                     homes.extend(page_properties)
 
+        return self._finalize(homes)
+
+    def _finalize(self, homes):
+        """Client-side filters and sort applied to a search's collected results (idempotent)."""
         # Apply client-side hour-based filtering if needed
         # (API only supports day-level filtering, so we post-filter for hour precision)
         has_hour_precision = (self.date_from_precision == "hour" or self.date_to_precision == "hour")

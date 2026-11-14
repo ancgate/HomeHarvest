@@ -35,7 +35,7 @@ def scrape_property(
     foreclosure: bool = None,
     extra_property_data: bool = True,
     exclude_pending: bool = False,
-    limit: int = 10000,
+    limit: int | None = 10000,
     offset: int = 0,
     # New date/time filtering parameters
     past_hours: int | timedelta = None,
@@ -108,7 +108,10 @@ def scrape_property(
     :param foreclosure: If set, fetches only foreclosure listings.
     :param extra_property_data: Increases requests by O(n). If set, this fetches additional property data (e.g. agent, broker, property evaluations etc.)
     :param exclude_pending: If true, this excludes pending or contingent properties from the results, unless listing type is pending.
-    :param limit: Limit the number of results returned. Maximum is 10,000.
+    :param limit: Limit the number of results returned (default 10,000). Realtor.com returns at most 10,000
+        results per search; with limit=None (or a larger limit) the search is split automatically by listing
+        type, then price bands (for sale / for rent / pending) or sold-date ranges (sold) until every piece
+        fits. Off-market searches can't be split and stop at 10,000 (with a warning).
     :param offset: Starting position for pagination within the 10k limit (offset + limit cannot exceed 10,000). Use with limit to fetch results in chunks (e.g., offset=200, limit=200 fetches results 200-399). Should be a multiple of 200 (page size) for optimal performance. Default is 0. Note: Cannot be used to bypass the 10k API limit - use date ranges (date_from/date_to) to narrow searches and fetch more data.
 
     New parameters:
