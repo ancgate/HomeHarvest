@@ -29,7 +29,7 @@ import json
 import math
 import os
 from datetime import date, datetime
-from typing import Any, Iterable
+from typing import Any
 from urllib.parse import quote_plus
 from xml.sax.saxutils import escape as xml_escape
 
