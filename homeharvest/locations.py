@@ -24,6 +24,7 @@ from typing import Any, Iterable
 import pandas as pd
 
 __all__ = [
+    "add_place_types",
     "get_states",
     "get_state",
     "get_counties",
@@ -218,10 +219,19 @@ def get_counties(state: str, *, listing_type: str | list[str] | None = None, wit
 
 
 def get_cities(state: str, county: str | None = None, *, listing_type: str | list[str] | None = None,
-               with_counts: bool = False, proxy: str | None = None,
-               fallback_limit: int = 10000) -> list[str] | pd.DataFrame:
-    """Cities (including towns, villages and CDPs) in a state or county that have listings."""
-    return _lookup("city", "city", "city", state, county, None, listing_type, with_counts, proxy, fallback_limit)
+               with_counts: bool = False, place_type: bool = False, proxy: str | None = None,
+               overpass_url: str | None = None, fallback_limit: int = 10000) -> list[str] | pd.DataFrame:
+    """Cities (including towns, villages and CDPs) in a state or county that have listings.
+
+    :param place_type: Return a DataFrame with OpenStreetMap place_type (city / town / village / hamlet),
+        municipal_type, incorporated and population columns (see :func:`add_place_types`).
+    """
+    result = _lookup("city", "city", "city", state, county, None, listing_type, with_counts or place_type, proxy,
+                     fallback_limit)
+    if not place_type:
+        return result
+    result.insert(0, "state", get_state(state)["code"])
+    return add_place_types(result, overpass_url=overpass_url)
 
 
 def get_zip_codes(state: str | None = None, county: str | None = None, city: str | None = None, *,
@@ -356,3 +366,143 @@ def aggregate_locations(properties: Any, by: Iterable[str] = ("state", "county",
     result["min_list_price"] = grouped["list_price"].min()
     result["max_list_price"] = grouped["list_price"].max()
     return result.reset_index().sort_values("listing_count", ascending=False, kind="stable").reset_index(drop=True)
+
+
+# ---------------------------------------------------------------------------
+# City / town / village types (OpenStreetMap)
+# ---------------------------------------------------------------------------
+
+_PLACE_RANK = {"city": 0, "town": 1, "village": 2, "hamlet": 3, "suburb": 4, "locality": 5, "neighbourhood": 6,
+               "isolated_dwelling": 7}
+_NAMES_PER_QUERY = 40
+
+
+def _name_variants(name: str) -> list[str]:
+    name = " ".join(str(name).split())
+    variants = [name, name.title()]
+    for short, long in (("St. ", "Saint "), ("St ", "Saint "), ("Ft. ", "Fort "), ("Ft ", "Fort "),
+                        ("Mt. ", "Mount "), ("Mt ", "Mount ")):
+        if name.startswith(short):
+            variants.append(long + name[len(short):])
+        if name.startswith(long):
+            variants.append("St. " + name[len(long):] if long == "Saint " else short + name[len(long):])
+    return list(dict.fromkeys(variants))
+
+
+def _place_query(state_code: str, names: list[str]) -> str:
+    from .osm import ql_string
+
+    places = "".join(f'node(area.st)["place"]["name"={ql_string(n)}];' for n in names)
+    towns = "".join(
+        f'relation(area.st)["boundary"="administrative"]["admin_level"="8"]["name"={ql_string(n)}];' for n in names
+    )
+    return (
+        "[out:json][timeout:120];\n"
+        f'area["ISO3166-2"="US-{state_code}"]["admin_level"="4"]->.st;\n'
+        f"({places})->.places;\n({towns})->.towns;\n"
+        ".places out body;\n.towns out tags center;"
+    )
+
+
+def _osm_places_for_state(state_code: str, cities: dict[str, tuple[float, float] | None], client) -> dict[str, dict]:
+    from .osm import haversine_m, osm_url
+
+    variants = {city: _name_variants(city) for city in cities}
+    all_names = list(dict.fromkeys(n for names in variants.values() for n in names))
+    elements = []
+    for start in range(0, len(all_names), _NAMES_PER_QUERY):
+        data = client.query(_place_query(state_code, all_names[start:start + _NAMES_PER_QUERY]))
+        elements += [e for e in data.get("elements", []) if isinstance(e, dict)]
+
+    def coords(element):
+        if element.get("lat") is not None:
+            return element["lat"], element["lon"]
+        center = element.get("center") or {}
+        return (center["lat"], center["lon"]) if center.get("lat") is not None else None
+
+    def near(point, element):
+        here = coords(element)
+        return haversine_m(point[0], point[1], here[0], here[1]) if point and here else 0.0
+
+    out = {}
+    for city, point in cities.items():
+        keys = {n.lower() for n in variants[city]}
+        nodes = [e for e in elements if e.get("type") == "node" and (e.get("tags") or {}).get("name", "").lower() in keys]
+        bounds = [e for e in elements if e.get("type") == "relation"
+                  and (e.get("tags") or {}).get("name", "").lower() in keys]
+        nodes.sort(key=lambda e: (near(point, e), _PLACE_RANK.get(e["tags"].get("place"), 99)))
+        node = nodes[0] if nodes else None
+        anchor = coords(node) if node else point
+        bounds.sort(key=lambda e: near(anchor, e))
+        boundary = bounds[0] if bounds and (anchor is None or near(anchor, bounds[0]) <= 30_000) else None
+
+        tags = (node or {}).get("tags") or {}
+        population = str(tags.get("population") or (boundary or {}).get("tags", {}).get("population") or "")
+        population = population.replace(",", "").split(";")[0].strip()
+        out[city] = {
+            "place_type": tags.get("place"),
+            "municipal_type": ((boundary or {}).get("tags") or {}).get("border_type"),
+            "incorporated": True if boundary else (False if node else None),
+            "population": int(population) if population.isdigit() else None,
+            "place_osm_url": osm_url(node or boundary) if (node or boundary) else None,
+        }
+    return out
+
+
+def add_place_types(data: Any, city_column: str = "city", state_column: str = "state",
+                    overpass_url: str | None = None, client=None) -> pd.DataFrame:
+    """Add whether each city is a city, town, village or hamlet, using OpenStreetMap.
+
+    Works on any DataFrame with city and state columns: scrape_property() results,
+    get_cities(with_counts=True), aggregate_locations(), get_location_hierarchy(), ...
+
+    Adds:
+    * place_type - OpenStreetMap's settlement class (city / town / village / hamlet / ...), by size;
+    * municipal_type - legal type of the municipality's boundary (city / town / village / borough), if any;
+    * incorporated - True if the place has its own municipal boundary, False for unincorporated places
+      such as census-designated places (e.g. Lehigh Acres, FL), None if not found;
+    * population and place_osm_url.
+
+    One Overpass query per state (per 40 names); answers are cached for 7 days.
+    """
+    from .nearby import get_overpass_client
+
+    df = data.copy() if isinstance(data, pd.DataFrame) else pd.DataFrame(data)
+    columns = ["place_type", "municipal_type", "incorporated", "population", "place_osm_url"]
+    if df.empty or city_column not in df.columns or state_column not in df.columns:
+        for column in columns:
+            df[column] = pd.Series(dtype="object")
+        return df
+
+    client = client or get_overpass_client(overpass_url)
+    has_coords = {"latitude", "longitude"} <= set(df.columns)
+    wanted: dict[str, dict[str, tuple[float, float] | None]] = {}
+    for (state, city), group in df.groupby([state_column, city_column], dropna=True):
+        try:
+            code = get_state(state)["code"]
+        except ValueError:
+            continue
+        point = None
+        if has_coords:
+            lat = pd.to_numeric(group["latitude"], errors="coerce").mean()
+            lon = pd.to_numeric(group["longitude"], errors="coerce").mean()
+            point = (lat, lon) if pd.notna(lat) and pd.notna(lon) else None
+        wanted.setdefault(code, {})[str(city)] = point
+
+    found: dict[tuple[str, str], dict] = {}
+    for code, cities in wanted.items():
+        for city, info in _osm_places_for_state(code, cities, client).items():
+            found[(code, city)] = info
+
+    def lookup(row, column):
+        try:
+            code = get_state(row[state_column])["code"]
+        except (ValueError, TypeError):
+            return None
+        return (found.get((code, str(row[city_column]))) or {}).get(column)
+
+    for column in columns:
+        df[column] = [lookup(row, column) for _, row in df.iterrows()]
+    df["population"] = pd.array(df["population"], dtype="Int64")
+    df["incorporated"] = pd.array(df["incorporated"], dtype="boolean")  # True / False / <NA> (not found)
+    return df

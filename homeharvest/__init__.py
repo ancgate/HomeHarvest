@@ -15,7 +15,8 @@ from .maps import (
 )
 from .nearby import add_nearby, list_aspects, normalize_proximity, nearby_columns
 from .locations import (
-    get_states, get_state, get_counties, get_cities, get_zip_codes, get_location_hierarchy, aggregate_locations
+    get_states, get_state, get_counties, get_cities, get_zip_codes, get_location_hierarchy, aggregate_locations,
+    add_place_types,
 )
 from .core.scrapers.models import ListingType, SearchPropertyType, ReturnType, Property
 from .exceptions import AuthenticationError, BlockedError, NetworkError, RequestFailedError
