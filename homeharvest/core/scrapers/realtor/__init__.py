@@ -37,6 +37,8 @@ from .queries import (
     SEARCH_SUGGESTIONS_QUERY,
     DETAIL_INSURANCE_FIELDS,
     DETAIL_MARKET_STATS_FIELDS,
+    DETAIL_PROPERTY_HISTORY_FIELDS,
+    DETAIL_ENVIRONMENTAL_RISK_FIELDS,
     build_property_details_query,
     build_location_aggregates_query,
 )
@@ -55,6 +57,8 @@ class PropertyDetailsError(Exception):
 
 #: GraphQL selections requested for each opt-in include_* flag
 DETAIL_SELECTIONS = {
+    "property_history": DETAIL_PROPERTY_HISTORY_FIELDS,
+    "environmental_risk": DETAIL_ENVIRONMENTAL_RISK_FIELDS,
     "insurance": DETAIL_INSURANCE_FIELDS,
     "market_stats": DETAIL_MARKET_STATS_FIELDS,
 }

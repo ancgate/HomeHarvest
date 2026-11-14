@@ -66,6 +66,8 @@ def scrape_property(
     keywords: str | list[str] = None,
     match_mode: str = "any",
     # Opt-in extra data (each costs extra batched requests)
+    include_property_history: bool = False,
+    include_environmental_risk: bool = False,
     include_insurance: bool = False,
     include_market_stats: bool = False,
 ) -> Union[pd.DataFrame, list[dict], list[Property]]:
@@ -137,6 +139,10 @@ def scrape_property(
         Note: matching is client-side, so it filters the (up to `limit`) listings returned by the search.
 
     Opt-in extra data (False by default; each adds batched requests for the returned properties):
+    :param include_property_history: Listing/sale history (date, event, price, price change, source), the
+        original list price of the current listing, the most recent price change, and buyer agent details.
+    :param include_environmental_risk: First Street flood, wildfire, heat, wind and air-quality risk factors
+        (score 1-10 + severity + trend), FEMA flood zone, flood-insurance requirement and noise score.
     :param include_insurance: Homeowner's insurance monthly estimate, insurance/property-tax rates, estimated
         monthly payment, and flood/fire insurance quotes.
     :param include_market_stats: Realtor.com rent estimate plus neighborhood and ZIP medians
@@ -244,6 +250,8 @@ def scrape_property(
         # Pagination control
         parallel=parallel,
         mls_status=mls_status,
+        include_property_history=include_property_history,
+        include_environmental_risk=include_environmental_risk,
         features=feature_matcher.features or None,
         nearby=feature_matcher.nearby or None,
         keywords=feature_matcher.keywords or None,
@@ -261,6 +269,8 @@ def scrape_property(
     extra_groups = [
         group for group, enabled in (
             ("features", feature_matcher.active),
+            ("property_history", include_property_history),
+            ("environmental_risk", include_environmental_risk),
             ("insurance", include_insurance),
             ("market_stats", include_market_stats),
         ) if enabled

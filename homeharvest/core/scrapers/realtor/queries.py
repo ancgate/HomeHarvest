@@ -881,6 +881,80 @@ DETAIL_MARKET_STATS_FIELDS = """
 """ % (_HOUSING_MARKET_FIELDS, _HOUSING_MARKET_FIELDS)
 
 
+_ADVERTISER_PHONE_FIELDS = "phones { number type primary ext }"
+
+#: Listing / sale history, price changes and the buyer side of past sales
+DETAIL_PROPERTY_HISTORY_FIELDS = """
+    last_price_change_amount
+    last_price_change_date
+    property_history {
+        date
+        event_name
+        price
+        price_change
+        price_sqft
+        source_name
+        source_listing_id
+        status
+    }
+    buyers {
+        type
+        name
+        email
+        fulfillment_id
+        nrds_id
+        mls_set
+        state_license
+        %s
+        office { name email fulfillment_id mls_set %s }
+        broker { name fulfillment_id }
+    }
+""" % (_ADVERTISER_PHONE_FIELDS, _ADVERTISER_PHONE_FIELDS)
+
+#: First Street flood / fire / heat / wind / air risk factors and noise score
+DETAIL_ENVIRONMENTAL_RISK_FIELDS = """
+    local {
+        flood {
+            flood_factor_score
+            flood_factor_severity
+            flood_trend
+            fema_zone
+            insurance_requirement
+            environmental_risk
+            firststreet_url
+        }
+        wildfire {
+            fire_factor_score
+            fire_factor_severity
+            fire_trend
+            firststreet_url
+        }
+        heat {
+            heat_factor_score
+            heat_factor_severity
+            heat_trend
+            firststreet_url
+        }
+        wind {
+            wind_factor_score
+            wind_factor_severity
+            wind_trend
+            firststreet_url
+        }
+        air {
+            air_factor_score
+            air_factor_severity
+            air_trend
+            firststreet_url
+        }
+        noise {
+            score
+            noise_categories { type text }
+        }
+    }
+"""
+
+
 def build_property_details_query(property_ids: list[str], selections: list[str]) -> str:
     """Build one GraphQL document that fetches the requested detail selections for many homes.
 
