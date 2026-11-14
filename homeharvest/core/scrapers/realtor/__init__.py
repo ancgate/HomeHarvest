@@ -45,6 +45,7 @@ from .processors import (
     get_key
 )
 from .details import apply_details_to_property, apply_details_to_raw
+from ....features import filter_properties
 
 
 class PropertyDetailsError(Exception):
@@ -659,6 +660,15 @@ class RealtorScraper(Scraper):
     def _apply_post_filters(self, homes):
         if self.mls_status:
             homes = self._apply_mls_status_filter(homes)
+        if self.features or self.nearby or self.keywords:
+            #: match on tags, feature details and description text; annotates matched_features etc.
+            homes = filter_properties(
+                homes,
+                features=self.features,
+                nearby=self.nearby,
+                keywords=self.keywords,
+                match_mode=self.match_mode,
+            )
         return homes
 
     def _apply_mls_status_filter(self, homes):

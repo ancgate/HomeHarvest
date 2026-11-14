@@ -8,6 +8,8 @@ from .utils import (
     convert_to_datetime_string, extract_timedelta_hours, extract_timedelta_days, detect_precision_and_convert
 )
 from .core.scrapers.realtor import RealtorScraper
+from .features import FeatureMatcher, filter_properties, list_features, match_property, register_feature, FeatureDefinition
+from .maps import to_osm_map, to_google_maps, to_kml, to_google_my_maps_csv, to_geojson, export_map
 from .core.scrapers.models import ListingType, SearchPropertyType, ReturnType, Property
 from typing import Union, Optional, List
 
@@ -52,6 +54,10 @@ def scrape_property(
     parallel: bool = True,
     # MLS status filter (e.g. expired / withdrawn listings)
     mls_status: str | list[str] = None,
+    # Keyword / feature matching (client-side, on tags + feature details + description)
+    features: str | list[str] = None,
+    keywords: str | list[str] = None,
+    match_mode: str = "any",
     # Opt-in extra data (each costs extra batched requests)
     include_insurance: bool = False,
     include_market_stats: bool = False,
@@ -109,6 +115,16 @@ def scrape_property(
     :param mls_status: Keep only listings whose MLS status contains one of these values (case-insensitive),
         e.g. mls_status=["expired", "withdrawn", "cancel"] with listing_type="off_market" to look for expired listings.
 
+    Keyword / feature matching (see homeharvest.list_features() for the catalog):
+    :param features: Named listing features, e.g. ["cul_de_sac", "corner_lot", "pool"]. Matched against the
+        listing's tags, feature details and description. Use "likely_cul_de_sac" to also include streets whose
+        suffix usually means a cul-de-sac (Ct, Court, Cir, Cove).
+    :param keywords: Free-text keywords, e.g. ["cul de sac", "seawall"]. Punctuation/spacing tolerant.
+    :param match_mode: "any" (default) keeps listings matching at least one term of each group given
+        (features, keywords); "all" requires every term. Matching listings get matched_features,
+        matched_keywords and feature_evidence (why it matched) columns.
+        Note: matching is client-side, so it filters the (up to `limit`) listings returned by the search.
+
     Opt-in extra data (False by default; each adds batched requests for the returned properties):
     :param include_insurance: Homeowner's insurance monthly estimate, insurance/property-tax rates, estimated
         monthly payment, and flood/fire insurance quotes.
@@ -128,6 +144,9 @@ def scrape_property(
 
     if isinstance(mls_status, str):
         mls_status = [mls_status]
+
+    #: validate feature keys / match mode up front (raises ValueError with suggestions)
+    feature_matcher = FeatureMatcher(features=features, keywords=keywords, match_mode=match_mode)
 
     # Validate new last_update_date filtering parameters
     validate_last_update_filters(
@@ -214,6 +233,9 @@ def scrape_property(
         # Pagination control
         parallel=parallel,
         mls_status=mls_status,
+        features=feature_matcher.features or None,
+        keywords=feature_matcher.keywords or None,
+        match_mode=match_mode,
         include_insurance=include_insurance,
         include_market_stats=include_market_stats,
     )
@@ -226,6 +248,7 @@ def scrape_property(
 
     extra_groups = [
         group for group, enabled in (
+            ("features", feature_matcher.active),
             ("insurance", include_insurance),
             ("market_stats", include_market_stats),
         ) if enabled
