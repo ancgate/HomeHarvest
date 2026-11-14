@@ -69,14 +69,87 @@ ordered_properties = [
     "office_name",
     "office_email",
     "office_phones",
+    "buyer_agent_id",
+    "buyer_agent_name",
+    "buyer_agent_email",
+    "buyer_agent_phones",
+    "buyer_broker_name",
+    "buyer_office_name",
+    "buyer_office_phones",
     "nearby_schools",
     "primary_photo",
-    "alt_photos"
+    "alt_photos",
+    "tags",
 ]
 
+#: Columns only added to the DataFrame when the matching option is used on scrape_property()
+OPTIONAL_COLUMNS = {
+    "features": [
+        "matched_features",
+        "matched_keywords",
+        "feature_evidence",
+    ],
+    "property_history": [
+        "original_list_price",
+        "last_price_change_amount",
+        "last_price_change_date",
+        "property_history",
+    ],
+    "environmental_risk": [
+        "flood_factor_score",
+        "flood_factor_severity",
+        "flood_fema_zone",
+        "flood_insurance_requirement",
+        "fire_factor_score",
+        "fire_factor_severity",
+        "heat_factor_score",
+        "heat_factor_severity",
+        "wind_factor_score",
+        "wind_factor_severity",
+        "air_factor_score",
+        "air_factor_severity",
+        "noise_score",
+        "environmental_risk_url",
+    ],
+    "insurance": [
+        "home_insurance_monthly",
+        "insurance_rate",
+        "property_tax_rate",
+        "property_tax_monthly",
+        "estimated_monthly_payment",
+        "flood_insurance_requirement",
+        "flood_insurance_quotes",
+        "fire_insurance_quotes",
+    ],
+    "market_stats": [
+        "estimated_rent",
+        "estimated_rent_low",
+        "estimated_rent_high",
+        "neighborhood_median_rent_price",
+        "neighborhood_median_listing_price",
+        "neighborhood_median_sold_price",
+        "neighborhood_median_price_per_sqft",
+        "neighborhood_median_days_on_market",
+        "zip_median_rent_price",
+        "zip_median_listing_price",
+        "zip_median_sold_price",
+    ],
+}
 
-def process_result(result: Property) -> pd.DataFrame:
-    prop_data = {prop: None for prop in ordered_properties}
+
+def get_columns(extra_groups=None) -> list[str]:
+    """Base DataFrame columns plus any optional column groups (see OPTIONAL_COLUMNS)."""
+    columns = list(ordered_properties)
+    for group in extra_groups or []:
+        for column in OPTIONAL_COLUMNS.get(group, []):
+            if column not in columns:
+                columns.append(column)
+    return columns
+
+
+def process_result(result: Property, extra_groups=None) -> pd.DataFrame:
+    columns = get_columns(extra_groups)
+    prop_data = {prop: None for prop in columns}
     prop_data.update(result.model_dump())
 
     if "address" in prop_data and prop_data["address"]:
@@ -118,6 +191,23 @@ def process_result(result: Property) -> pd.DataFrame:
             prop_data["office_phones"] = office_data.get("phones")
             prop_data["office_mls_set"] = office_data.get("mls_set")
 
+        if advertiser_data.get("buyer_agent"):
+            buyer_agent = advertiser_data["buyer_agent"]
+            prop_data["buyer_agent_id"] = buyer_agent.get("uuid")
+            prop_data["buyer_agent_name"] = buyer_agent.get("name")
+            prop_data["buyer_agent_email"] = buyer_agent.get("email")
+            prop_data["buyer_agent_phones"] = buyer_agent.get("phones")
+
+        if advertiser_data.get("buyer_broker"):
+            prop_data["buyer_broker_name"] = advertiser_data["buyer_broker"].get("name")
+
+        if advertiser_data.get("buyer_office"):
+            prop_data["buyer_office_name"] = advertiser_data["buyer_office"].get("name")
+            prop_data["buyer_office_phones"] = advertiser_data["buyer_office"].get("phones")
+
+    prop_data["tags"] = ", ".join(result.tags) if result.tags else None
+    _flatten_optional_groups(result, prop_data, extra_groups or [])
+
     prop_data["price_per_sqft"] = prop_data["prc_sqft"]
     prop_data["nearby_schools"] = filter(None, prop_data["nearby_schools"]) if prop_data["nearby_schools"] else None
     prop_data["nearby_schools"] = ", ".join(set(prop_data["nearby_schools"])) if prop_data["nearby_schools"] else None
@@ -152,9 +242,85 @@ def process_result(result: Property) -> pd.DataFrame:
         prop_data["text"] = description.text
 
     properties_df = pd.DataFrame([prop_data])
-    properties_df = properties_df.reindex(columns=ordered_properties)
+    properties_df = properties_df.reindex(columns=columns)
 
-    return properties_df[ordered_properties]
+    return properties_df[columns]
+
+
+def _risk_columns(prop_data: dict, prefix: str, risk) -> None:
+    if risk is not None:
+        prop_data[f"{prefix}_factor_score"] = risk.score
+        prop_data[f"{prefix}_factor_severity"] = risk.severity
+
+
+def _market_columns(prop_data: dict, prefix: str, stats, fields) -> None:
+    if stats is not None:
+        for field in fields:
+            prop_data[f"{prefix}_{field}"] = getattr(stats, field)
+
+
+def _flatten_optional_groups(result: Property, prop_data: dict, extra_groups) -> None:
+    """Flatten nested opt-in data (features, history, risk, insurance, market stats) into columns."""
+    if "features" in extra_groups:
+        prop_data["matched_features"] = ", ".join(result.matched_features) if result.matched_features else None
+        prop_data["matched_keywords"] = ", ".join(result.matched_keywords) if result.matched_keywords else None
+        prop_data["feature_evidence"] = (
+            "; ".join(f"{k}: {v}" for k, v in result.feature_evidence.items()) if result.feature_evidence else None
+        )
+
+    if "property_history" in extra_groups:
+        prop_data["property_history"] = (
+            [event.model_dump() for event in result.property_history] if result.property_history else None
+        )
+        if result.last_price_change_date:
+            prop_data["last_price_change_date"] = result.last_price_change_date.strftime("%Y-%m-%d %H:%M:%S")
+
+    if "environmental_risk" in extra_groups and result.environmental_risk:
+        risk = result.environmental_risk
+        _risk_columns(prop_data, "flood", risk.flood)
+        _risk_columns(prop_data, "fire", risk.fire)
+        _risk_columns(prop_data, "heat", risk.heat)
+        _risk_columns(prop_data, "wind", risk.wind)
+        _risk_columns(prop_data, "air", risk.air)
+        if risk.flood:
+            prop_data["flood_fema_zone"] = ", ".join(risk.flood.fema_zone) if risk.flood.fema_zone else None
+            prop_data["flood_insurance_requirement"] = risk.flood.insurance_requirement
+        prop_data["noise_score"] = risk.noise_score
+        prop_data["environmental_risk_url"] = next(
+            (r.report_url for r in (risk.flood, risk.fire, risk.heat, risk.wind, risk.air) if r and r.report_url),
+            None,
+        )
+
+    if "insurance" in extra_groups and result.insurance:
+        insurance = result.insurance
+        prop_data["home_insurance_monthly"] = insurance.home_insurance_monthly
+        prop_data["insurance_rate"] = insurance.insurance_rate
+        prop_data["property_tax_rate"] = insurance.property_tax_rate
+        prop_data["property_tax_monthly"] = insurance.property_tax_monthly
+        prop_data["estimated_monthly_payment"] = insurance.estimated_monthly_payment
+        prop_data["flood_insurance_quotes"] = (
+            [q.model_dump() for q in insurance.flood_insurance_quotes] if insurance.flood_insurance_quotes else None
+        )
+        prop_data["fire_insurance_quotes"] = (
+            [q.model_dump() for q in insurance.fire_insurance_quotes] if insurance.fire_insurance_quotes else None
+        )
+        if insurance.flood_insurance_requirement:
+            prop_data["flood_insurance_requirement"] = insurance.flood_insurance_requirement
+
+    if "market_stats" in extra_groups and result.market_stats:
+        market = result.market_stats
+        prop_data["estimated_rent"] = market.estimated_rent
+        prop_data["estimated_rent_low"] = market.estimated_rent_low
+        prop_data["estimated_rent_high"] = market.estimated_rent_high
+        _market_columns(
+            prop_data, "neighborhood", market.neighborhood,
+            ["median_rent_price", "median_listing_price", "median_sold_price",
+             "median_price_per_sqft", "median_days_on_market"],
+        )
+        _market_columns(
+            prop_data, "zip", market.zip_code,
+            ["median_rent_price", "median_listing_price", "median_sold_price"],
+        )
 
 
 def validate_input(listing_type: str | list[str] | None) -> None:

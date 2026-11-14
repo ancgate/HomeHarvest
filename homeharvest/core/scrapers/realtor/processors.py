@@ -73,7 +73,56 @@ def process_advertisers(advertisers: list[dict] | None) -> Advertisers | None:
                     name=advertiser["builder"].get("name"),
                 )
 
+        if advertiser_type and "buyer" in advertiser_type.lower():  #: buyer's agent (sold listings)
+            _apply_buyer_advertiser(processed_advertisers, advertiser, _parse_fulfillment_id)
+
     return processed_advertisers
+
+
+def _apply_buyer_advertiser(processed_advertisers: Advertisers, advertiser: dict, parse_id) -> None:
+    """Populate buyer_agent / buyer_broker / buyer_office from a buyer-side advertiser entry."""
+    if processed_advertisers.buyer_agent is None and (advertiser.get("name") or advertiser.get("fulfillment_id")):
+        processed_advertisers.buyer_agent = Agent(
+            uuid=parse_id(advertiser.get("fulfillment_id")),
+            nrds_id=advertiser.get("nrds_id"),
+            mls_set=advertiser.get("mls_set"),
+            name=advertiser.get("name"),
+            email=advertiser.get("email"),
+            phones=advertiser.get("phones"),
+            state_license=advertiser.get("state_license"),
+        )
+
+    broker = advertiser.get("broker") or {}
+    if processed_advertisers.buyer_broker is None and broker.get("name"):
+        processed_advertisers.buyer_broker = Broker(
+            uuid=parse_id(broker.get("fulfillment_id")),
+            name=broker.get("name"),
+        )
+
+    office = advertiser.get("office") or {}
+    if processed_advertisers.buyer_office is None and (office.get("name") or office.get("fulfillment_id")):
+        processed_advertisers.buyer_office = Office(
+            uuid=parse_id(office.get("fulfillment_id")),
+            mls_set=office.get("mls_set"),
+            name=office.get("name"),
+            email=office.get("email"),
+            phones=office.get("phones"),
+        )
+
+
+def apply_buyers(advertisers: Advertisers | None, buyers: list[dict] | None) -> Advertisers | None:
+    """Merge the dedicated ``home.buyers`` list into an Advertisers object."""
+    if not buyers:
+        return advertisers
+
+    def _parse_fulfillment_id(fulfillment_id):
+        return fulfillment_id if fulfillment_id and fulfillment_id != "0" else None
+
+    advertisers = advertisers or Advertisers()
+    for buyer in buyers:
+        if buyer:
+            _apply_buyer_advertiser(advertisers, buyer, _parse_fulfillment_id)
+    return advertisers
 
 
 def process_property(result: dict, mls_only: bool = False, extra_property_data: bool = False, 

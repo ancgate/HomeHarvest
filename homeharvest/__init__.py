@@ -3,11 +3,19 @@ import pandas as pd
 from datetime import datetime, timedelta, date
 from .core.scrapers import ScraperInput
 from .utils import (
-    process_result, ordered_properties, validate_input, validate_dates, validate_limit,
+    process_result, ordered_properties, get_columns, validate_input, validate_dates, validate_limit,
     validate_offset, validate_datetime, validate_filters, validate_sort, validate_last_update_filters,
     convert_to_datetime_string, extract_timedelta_hours, extract_timedelta_days, detect_precision_and_convert
 )
 from .core.scrapers.realtor import RealtorScraper
+from .features import FeatureMatcher, filter_properties, list_features, match_property, register_feature, FeatureDefinition
+from .maps import (
+    to_osm_map, to_google_maps, to_kml, to_google_my_maps_csv, to_geojson, export_map, generate_map,
+    cluster_properties,
+)
+from .locations import (
+    get_states, get_state, get_counties, get_cities, get_zip_codes, get_location_hierarchy, aggregate_locations
+)
 from .core.scrapers.models import ListingType, SearchPropertyType, ReturnType, Property
 from typing import Union, Optional, List
 
@@ -50,6 +58,18 @@ def scrape_property(
     sort_direction: str = "desc",
     # Pagination control
     parallel: bool = True,
+    # MLS status filter (e.g. expired / withdrawn listings)
+    mls_status: str | list[str] = None,
+    # Keyword / feature matching (client-side, on tags + feature details + description)
+    features: str | list[str] = None,
+    nearby: str | list[str] = None,
+    keywords: str | list[str] = None,
+    match_mode: str = "any",
+    # Opt-in extra data (each costs extra batched requests)
+    include_property_history: bool = False,
+    include_environmental_risk: bool = False,
+    include_insurance: bool = False,
+    include_market_stats: bool = False,
 ) -> Union[pd.DataFrame, list[dict], list[Property]]:
     """
     Scrape properties from Realtor.com based on a given location and listing type.
@@ -101,6 +121,32 @@ def scrape_property(
     :param parallel: Controls pagination strategy. True (default) = fetch all pages in parallel for maximum speed.
         False = fetch pages sequentially with early termination checks (useful for rate limiting or narrow time windows).
         Sequential mode will stop paginating as soon as time-based filters indicate no more matches are possible.
+    :param mls_status: Keep only listings whose MLS status contains one of these values (case-insensitive),
+        e.g. mls_status=["expired", "withdrawn", "cancel"] with listing_type="off_market" to look for expired listings.
+
+    Keyword / feature matching (see homeharvest.list_features() for the catalog):
+    :param features: Named listing features, e.g. ["cul_de_sac", "corner_lot", "pool"]. Matched against the
+        listing's tags, feature details and description. Use "likely_cul_de_sac" to also include streets whose
+        suffix usually means a cul-de-sac (Ct, Court, Cir, Cove).
+    :param nearby: Land / surroundings categories: farms_and_ranches, hunting, timberland, undeveloped,
+        recreational, commercial, horse, homesite, house, lakefront, riverfront, oceanfront, waterfront
+        (waterfront = lakefront, riverfront, oceanfront or canal front). Pair with property_type=["land", "farm"].
+    :param keywords: Free-text keywords, e.g. ["cul de sac", "seawall"]. Punctuation/spacing tolerant.
+    :param match_mode: "any" (default) keeps listings matching at least one term of each group given
+        (features, nearby, keywords); "all" requires every term. Groups are combined with AND, e.g.
+        features=["cul_de_sac"], nearby=["lakefront", "riverfront"] = cul-de-sac AND (lake OR river).
+        Matching listings get matched_features, matched_keywords and feature_evidence (why it matched) columns.
+        Note: matching is client-side, so it filters the (up to `limit`) listings returned by the search.
+
+    Opt-in extra data (False by default; each adds batched requests for the returned properties):
+    :param include_property_history: Listing/sale history (date, event, price, price change, source), the
+        original list price of the current listing, the most recent price change, and buyer agent details.
+    :param include_environmental_risk: First Street flood, wildfire, heat, wind and air-quality risk factors
+        (score 1-10 + severity + trend), FEMA flood zone, flood-insurance requirement and noise score.
+    :param include_insurance: Homeowner's insurance monthly estimate, insurance/property-tax rates, estimated
+        monthly payment, and flood/fire insurance quotes.
+    :param include_market_stats: Realtor.com rent estimate plus neighborhood and ZIP medians
+        (median rent, listing price, sold price, price per sqft, days on market).
 
     Note: past_days and past_hours also accept timedelta objects for more Pythonic usage.
     """
@@ -112,6 +158,12 @@ def scrape_property(
         price_min, price_max, lot_sqft_min, lot_sqft_max, year_built_min, year_built_max
     )
     validate_sort(sort_by, sort_direction)
+
+    if isinstance(mls_status, str):
+        mls_status = [mls_status]
+
+    #: validate feature keys / match mode up front (raises ValueError with suggestions)
+    feature_matcher = FeatureMatcher(features=features, nearby=nearby, keywords=keywords, match_mode=match_mode)
 
     # Validate new last_update_date filtering parameters
     validate_last_update_filters(
@@ -197,6 +249,15 @@ def scrape_property(
         sort_direction=sort_direction,
         # Pagination control
         parallel=parallel,
+        mls_status=mls_status,
+        include_property_history=include_property_history,
+        include_environmental_risk=include_environmental_risk,
+        features=feature_matcher.features or None,
+        nearby=feature_matcher.nearby or None,
+        keywords=feature_matcher.keywords or None,
+        match_mode=match_mode,
+        include_insurance=include_insurance,
+        include_market_stats=include_market_stats,
     )
 
     site = RealtorScraper(scraper_input)
@@ -205,13 +266,24 @@ def scrape_property(
     if scraper_input.return_type != ReturnType.pandas:
         return results
 
-    properties_dfs = [df for result in results if not (df := process_result(result)).empty]
+    extra_groups = [
+        group for group, enabled in (
+            ("features", feature_matcher.active),
+            ("property_history", include_property_history),
+            ("environmental_risk", include_environmental_risk),
+            ("insurance", include_insurance),
+            ("market_stats", include_market_stats),
+        ) if enabled
+    ]
+    columns = get_columns(extra_groups)
+
+    properties_dfs = [df for result in results if not (df := process_result(result, extra_groups)).empty]
     if not properties_dfs:
         return pd.DataFrame()
 
     with warnings.catch_warnings():
         warnings.simplefilter("ignore", category=FutureWarning)
 
-        return pd.concat(properties_dfs, ignore_index=True, axis=0)[ordered_properties].replace(
+        return pd.concat(properties_dfs, ignore_index=True, axis=0)[columns].replace(
             {"None": pd.NA, None: pd.NA, "": pd.NA}
         )

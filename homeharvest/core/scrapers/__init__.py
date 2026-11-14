@@ -77,6 +77,21 @@ class ScraperInput(BaseModel):
     # Pagination control
     parallel: bool = True
 
+    # Client-side MLS status filter (e.g. ["expired", "withdrawn"])
+    mls_status: list[str] | None = None
+
+    # Keyword / feature matching (see homeharvest.features)
+    features: list[str] | None = None
+    nearby: list[str] | None = None
+    keywords: list[str] | None = None
+    match_mode: str = "any"
+
+    # Opt-in detail enrichment (extra requests, batched)
+    include_property_history: bool = False
+    include_environmental_risk: bool = False
+    include_insurance: bool = False
+    include_market_stats: bool = False
+
 
 class Scraper:
     def __init__(
@@ -90,6 +105,9 @@ class Scraper:
         self.proxies = {"http": self.proxy, "https": self.proxy} if self.proxy else None
 
         self.listing_type = scraper_input.listing_type
+        if isinstance(self.listing_type, list) and len(self.listing_type) == 1:
+            #: a one-element list behaves exactly like the single value (date filters need a single type)
+            self.listing_type = self.listing_type[0]
         self.radius = scraper_input.radius
         self.last_x_days = scraper_input.last_x_days
         self.mls_only = scraper_input.mls_only
@@ -131,6 +149,21 @@ class Scraper:
 
         # Pagination control
         self.parallel = scraper_input.parallel
+
+        # Client-side MLS status filter
+        self.mls_status = scraper_input.mls_status
+
+        # Keyword / feature matching
+        self.features = scraper_input.features
+        self.nearby = scraper_input.nearby
+        self.keywords = scraper_input.keywords
+        self.match_mode = scraper_input.match_mode
+
+        # Opt-in detail enrichment
+        self.include_property_history = scraper_input.include_property_history
+        self.include_environmental_risk = scraper_input.include_environmental_risk
+        self.include_insurance = scraper_input.include_insurance
+        self.include_market_stats = scraper_input.include_market_stats
 
     def search(self) -> list[Union[Property | dict]]: ...
 

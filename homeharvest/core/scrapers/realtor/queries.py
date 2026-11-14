@@ -803,3 +803,183 @@ SEARCH_SUGGESTIONS_QUERY = """query Search_suggestions($searchInput: SearchSugge
     original_string
   }
 }"""
+
+
+# ---------------------------------------------------------------------------
+# Opt-in property detail enrichment
+#
+# These selections are only requested when the matching include_* flag is set
+# on scrape_property(). They are fetched with aliased `home(property_id: ...)`
+# queries in small batches, so the main search query is never affected.
+# ---------------------------------------------------------------------------
+
+_INSURANCE_QUOTE_FIELDS = """
+    provider_name
+    provider_url
+    price
+    min_price
+    max_price
+    home_coverage
+    contents_coverage
+    expires
+"""
+
+_HOUSING_MARKET_FIELDS = """
+    geo_statistics {
+        housing_market {
+            median_rent_price
+            median_listing_price
+            median_sold_price
+            median_price_per_sqft
+            median_days_on_market
+        }
+    }
+"""
+
+#: Homeowner's insurance estimate + flood/fire insurance quotes (issue #121)
+DETAIL_INSURANCE_FIELDS = """
+    mortgage {
+        insurance_rate
+        property_tax_rate
+        estimate {
+            monthly_payment
+            monthly_payment_details {
+                type
+                amount
+                display_name
+            }
+        }
+    }
+    local {
+        flood {
+            insurance_requirement
+            insurance_rates { %s }
+        }
+        wildfire {
+            insurance_rates { %s }
+        }
+    }
+""" % (_INSURANCE_QUOTE_FIELDS, _INSURANCE_QUOTE_FIELDS)
+
+#: Rent estimate + neighborhood / ZIP medians (issue #137)
+DETAIL_MARKET_STATS_FIELDS = """
+    rent_amount_model {
+        value
+        value_low
+        value_high
+    }
+    location {
+        neighborhoods {
+            name
+            %s
+        }
+        postal_code {
+            postal_code
+            %s
+        }
+    }
+""" % (_HOUSING_MARKET_FIELDS, _HOUSING_MARKET_FIELDS)
+
+
+_ADVERTISER_PHONE_FIELDS = "phones { number type primary ext }"
+
+#: Listing / sale history, price changes and the buyer side of past sales
+DETAIL_PROPERTY_HISTORY_FIELDS = """
+    last_price_change_amount
+    last_price_change_date
+    property_history {
+        date
+        event_name
+        price
+        price_change
+        price_sqft
+        source_name
+        source_listing_id
+        status
+    }
+    buyers {
+        type
+        name
+        email
+        fulfillment_id
+        nrds_id
+        mls_set
+        state_license
+        %s
+        office { name email fulfillment_id mls_set %s }
+        broker { name fulfillment_id }
+    }
+""" % (_ADVERTISER_PHONE_FIELDS, _ADVERTISER_PHONE_FIELDS)
+
+#: First Street flood / fire / heat / wind / air risk factors and noise score
+DETAIL_ENVIRONMENTAL_RISK_FIELDS = """
+    local {
+        flood {
+            flood_factor_score
+            flood_factor_severity
+            flood_trend
+            fema_zone
+            insurance_requirement
+            environmental_risk
+            firststreet_url
+        }
+        wildfire {
+            fire_factor_score
+            fire_factor_severity
+            fire_trend
+            firststreet_url
+        }
+        heat {
+            heat_factor_score
+            heat_factor_severity
+            heat_trend
+            firststreet_url
+        }
+        wind {
+            wind_factor_score
+            wind_factor_severity
+            wind_trend
+            firststreet_url
+        }
+        air {
+            air_factor_score
+            air_factor_severity
+            air_trend
+            firststreet_url
+        }
+        noise {
+            score
+            noise_categories { type text }
+        }
+    }
+"""
+
+
+def build_property_details_query(property_ids: list[str], selections: list[str]) -> str:
+    """Build one GraphQL document that fetches the requested detail selections for many homes.
+
+    Each home is aliased as ``home_<property_id>`` so a single request can cover a batch.
+    """
+    body = "\n".join(selections)
+    homes = "\n".join(
+        'home_%s: home(property_id: "%s") { property_id %s }' % (pid, pid, body)
+        for pid in property_ids
+    )
+    return "query GetPropertyDetails { %s }" % homes
+
+
+#: Realtor.com aggregations used by homeharvest.locations (county / city / postal_code lists)
+LOCATION_AGGREGATE_FIELDS = ("county", "city", "postal_code")
+
+
+def build_location_aggregates_query(fields: list[str], statuses: list[str], size: int) -> str:
+    for field in fields:
+        if field not in LOCATION_AGGREGATE_FIELDS:
+            raise ValueError(f"Unsupported aggregate field {field!r}")
+    status_param = f"status: [{', '.join(statuses)}]" if statuses else ""
+    return (
+        "query GetLocationAggregates($search_location: SearchLocation) { "
+        "home_search(query: { search_location: $search_location %s } limit: 1 "
+        "aggregate: { field: [%s], size: %d }) { total aggregation } }"
+        % (status_param, ", ".join(fields), int(size))
+    )
