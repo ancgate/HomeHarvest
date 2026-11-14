@@ -174,6 +174,11 @@ class Advertisers(BaseModel):
     builder: Builder | None = None
     office: Office | None = None
 
+    # Buyer side of the transaction (mostly populated for sold listings)
+    buyer_agent: Agent | None = Field(None, description="Agent that represented the buyer")
+    buyer_broker: Broker | None = Field(None, description="Broker that represented the buyer")
+    buyer_office: Office | None = Field(None, description="Office that represented the buyer")
+
 
 class Property(BaseModel):
     property_url: HttpUrl
@@ -239,8 +244,97 @@ class Property(BaseModel):
     photos: list[dict] | None = None  # Keep as dict for photo structure
     flags: HomeFlags | None = Field(None, description="Home flags for Listing/Property")
 
+    # Keyword / feature matching (populated when features, nearby or keywords filters are used)
+    matched_features: list[str] | None = Field(None, description="Catalog features (e.g. cul_de_sac, lakefront) this listing matched")
+    matched_keywords: list[str] | None = Field(None, description="Free-text keywords this listing matched")
+    feature_evidence: dict[str, str] | None = Field(None, description="Why each feature/keyword matched (tag, description snippet, street, ...)")
+
+    # Opt-in enrichment (each requires its include_* flag on scrape_property)
+    property_history: list[PropertyHistoryEvent] | None = Field(None, description="Listing/sale history (include_property_history=True)")
+    original_list_price: int | None = Field(None, description="Price when the current listing was first listed (include_property_history=True)")
+    last_price_change_amount: int | None = Field(None, description="Most recent price change, negative for a reduction (include_property_history=True)")
+    last_price_change_date: datetime | None = Field(None, description="Date of the most recent price change (include_property_history=True)")
+    environmental_risk: EnvironmentalRisk | None = Field(None, description="Flood, fire, heat, wind, air and noise risk (include_environmental_risk=True)")
+    insurance: InsuranceInfo | None = Field(None, description="Homeowner's insurance estimate and flood/fire quotes (include_insurance=True)")
+    market_stats: MarketStats | None = Field(None, description="Rent estimate and neighborhood/ZIP medians (include_market_stats=True)")
+
 
 # Specialized models for GraphQL types
+
+class PropertyHistoryEvent(BaseModel):
+    date: datetime | None = None
+    event_name: str | None = Field(None, description="e.g. Listed, Price Changed, Sold, Pending, Listing Removed")
+    price: int | None = None
+    price_change: int | None = None
+    price_sqft: float | None = None
+    source_name: str | None = None
+    source_listing_id: str | None = None
+    status: str | None = None
+
+
+class RiskFactor(BaseModel):
+    score: int | None = Field(None, description="Risk factor score (First Street: 1 minimal .. 10 extreme)")
+    severity: str | None = Field(None, description="Human readable severity, e.g. Minimal, Moderate, Major, Severe, Extreme")
+    trend: str | None = None
+    report_url: str | None = Field(None, description="Link to the full risk report")
+
+
+class FloodRisk(RiskFactor):
+    fema_zone: list[str] | None = Field(None, description="FEMA flood zone(s)")
+    insurance_requirement: str | None = Field(None, description="Whether flood insurance is required/recommended")
+    environmental_risk: int | None = None
+
+
+class EnvironmentalRisk(BaseModel):
+    flood: FloodRisk | None = None
+    fire: RiskFactor | None = None
+    heat: RiskFactor | None = None
+    wind: RiskFactor | None = None
+    air: RiskFactor | None = None
+    noise_score: float | None = None
+    noise_categories: list[dict] | None = None
+
+
+class InsuranceQuote(BaseModel):
+    provider_name: str | None = None
+    provider_url: str | None = None
+    price: float | None = None
+    min_price: float | None = None
+    max_price: float | None = None
+    home_coverage: float | None = None
+    contents_coverage: float | None = None
+    expires: datetime | None = None
+
+
+class InsuranceInfo(BaseModel):
+    home_insurance_monthly: int | None = Field(None, description="Estimated monthly homeowner's insurance")
+    insurance_rate: float | None = Field(None, description="Annual homeowner's insurance rate used by Realtor.com (fraction of price)")
+    property_tax_rate: float | None = None
+    property_tax_monthly: int | None = None
+    hoa_monthly: int | None = None
+    mortgage_insurance_monthly: int | None = None
+    principal_and_interest_monthly: int | None = None
+    estimated_monthly_payment: int | None = Field(None, description="Total estimated monthly ownership cost")
+    flood_insurance_requirement: str | None = None
+    flood_insurance_quotes: list[InsuranceQuote] | None = None
+    fire_insurance_quotes: list[InsuranceQuote] | None = None
+
+
+class HousingMarketStats(BaseModel):
+    median_rent_price: float | None = None
+    median_listing_price: float | None = None
+    median_sold_price: float | None = None
+    median_price_per_sqft: float | None = None
+    median_days_on_market: float | None = None
+
+
+class MarketStats(BaseModel):
+    estimated_rent: int | None = Field(None, description="Realtor.com rent estimate for this property")
+    estimated_rent_low: int | None = None
+    estimated_rent_high: int | None = None
+    neighborhood_name: str | None = None
+    neighborhood: HousingMarketStats | None = Field(None, description="Neighborhood medians (what the listing page shows)")
+    zip_code: HousingMarketStats | None = Field(None, description="ZIP code medians")
 
 class HomeMonthlyFee(BaseModel):
     description: str | None = None

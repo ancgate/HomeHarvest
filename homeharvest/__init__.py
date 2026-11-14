@@ -3,7 +3,7 @@ import pandas as pd
 from datetime import datetime, timedelta, date
 from .core.scrapers import ScraperInput
 from .utils import (
-    process_result, ordered_properties, validate_input, validate_dates, validate_limit,
+    process_result, ordered_properties, get_columns, validate_input, validate_dates, validate_limit,
     validate_offset, validate_datetime, validate_filters, validate_sort, validate_last_update_filters,
     convert_to_datetime_string, extract_timedelta_hours, extract_timedelta_days, detect_precision_and_convert
 )
@@ -50,6 +50,11 @@ def scrape_property(
     sort_direction: str = "desc",
     # Pagination control
     parallel: bool = True,
+    # MLS status filter (e.g. expired / withdrawn listings)
+    mls_status: str | list[str] = None,
+    # Opt-in extra data (each costs extra batched requests)
+    include_insurance: bool = False,
+    include_market_stats: bool = False,
 ) -> Union[pd.DataFrame, list[dict], list[Property]]:
     """
     Scrape properties from Realtor.com based on a given location and listing type.
@@ -101,6 +106,14 @@ def scrape_property(
     :param parallel: Controls pagination strategy. True (default) = fetch all pages in parallel for maximum speed.
         False = fetch pages sequentially with early termination checks (useful for rate limiting or narrow time windows).
         Sequential mode will stop paginating as soon as time-based filters indicate no more matches are possible.
+    :param mls_status: Keep only listings whose MLS status contains one of these values (case-insensitive),
+        e.g. mls_status=["expired", "withdrawn", "cancel"] with listing_type="off_market" to look for expired listings.
+
+    Opt-in extra data (False by default; each adds batched requests for the returned properties):
+    :param include_insurance: Homeowner's insurance monthly estimate, insurance/property-tax rates, estimated
+        monthly payment, and flood/fire insurance quotes.
+    :param include_market_stats: Realtor.com rent estimate plus neighborhood and ZIP medians
+        (median rent, listing price, sold price, price per sqft, days on market).
 
     Note: past_days and past_hours also accept timedelta objects for more Pythonic usage.
     """
@@ -112,6 +125,9 @@ def scrape_property(
         price_min, price_max, lot_sqft_min, lot_sqft_max, year_built_min, year_built_max
     )
     validate_sort(sort_by, sort_direction)
+
+    if isinstance(mls_status, str):
+        mls_status = [mls_status]
 
     # Validate new last_update_date filtering parameters
     validate_last_update_filters(
@@ -197,6 +213,9 @@ def scrape_property(
         sort_direction=sort_direction,
         # Pagination control
         parallel=parallel,
+        mls_status=mls_status,
+        include_insurance=include_insurance,
+        include_market_stats=include_market_stats,
     )
 
     site = RealtorScraper(scraper_input)
@@ -205,13 +224,21 @@ def scrape_property(
     if scraper_input.return_type != ReturnType.pandas:
         return results
 
-    properties_dfs = [df for result in results if not (df := process_result(result)).empty]
+    extra_groups = [
+        group for group, enabled in (
+            ("insurance", include_insurance),
+            ("market_stats", include_market_stats),
+        ) if enabled
+    ]
+    columns = get_columns(extra_groups)
+
+    properties_dfs = [df for result in results if not (df := process_result(result, extra_groups)).empty]
     if not properties_dfs:
         return pd.DataFrame()
 
     with warnings.catch_warnings():
         warnings.simplefilter("ignore", category=FutureWarning)
 
-        return pd.concat(properties_dfs, ignore_index=True, axis=0)[ordered_properties].replace(
+        return pd.concat(properties_dfs, ignore_index=True, axis=0)[columns].replace(
             {"None": pd.NA, None: pd.NA, "": pd.NA}
         )

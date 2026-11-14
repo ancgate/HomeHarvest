@@ -803,3 +803,92 @@ SEARCH_SUGGESTIONS_QUERY = """query Search_suggestions($searchInput: SearchSugge
     original_string
   }
 }"""
+
+
+# ---------------------------------------------------------------------------
+# Opt-in property detail enrichment
+#
+# These selections are only requested when the matching include_* flag is set
+# on scrape_property(). They are fetched with aliased `home(property_id: ...)`
+# queries in small batches, so the main search query is never affected.
+# ---------------------------------------------------------------------------
+
+_INSURANCE_QUOTE_FIELDS = """
+    provider_name
+    provider_url
+    price
+    min_price
+    max_price
+    home_coverage
+    contents_coverage
+    expires
+"""
+
+_HOUSING_MARKET_FIELDS = """
+    geo_statistics {
+        housing_market {
+            median_rent_price
+            median_listing_price
+            median_sold_price
+            median_price_per_sqft
+            median_days_on_market
+        }
+    }
+"""
+
+#: Homeowner's insurance estimate + flood/fire insurance quotes (issue #121)
+DETAIL_INSURANCE_FIELDS = """
+    mortgage {
+        insurance_rate
+        property_tax_rate
+        estimate {
+            monthly_payment
+            monthly_payment_details {
+                type
+                amount
+                display_name
+            }
+        }
+    }
+    local {
+        flood {
+            insurance_requirement
+            insurance_rates { %s }
+        }
+        wildfire {
+            insurance_rates { %s }
+        }
+    }
+""" % (_INSURANCE_QUOTE_FIELDS, _INSURANCE_QUOTE_FIELDS)
+
+#: Rent estimate + neighborhood / ZIP medians (issue #137)
+DETAIL_MARKET_STATS_FIELDS = """
+    rent_amount_model {
+        value
+        value_low
+        value_high
+    }
+    location {
+        neighborhoods {
+            name
+            %s
+        }
+        postal_code {
+            postal_code
+            %s
+        }
+    }
+""" % (_HOUSING_MARKET_FIELDS, _HOUSING_MARKET_FIELDS)
+
+
+def build_property_details_query(property_ids: list[str], selections: list[str]) -> str:
+    """Build one GraphQL document that fetches the requested detail selections for many homes.
+
+    Each home is aliased as ``home_<property_id>`` so a single request can cover a batch.
+    """
+    body = "\n".join(selections)
+    homes = "\n".join(
+        'home_%s: home(property_id: "%s") { property_id %s }' % (pid, pid, body)
+        for pid in property_ids
+    )
+    return "query GetPropertyDetails { %s }" % homes

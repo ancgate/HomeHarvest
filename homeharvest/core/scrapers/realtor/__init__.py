@@ -7,7 +7,10 @@ This module implements the scraper for realtor.com
 
 from __future__ import annotations
 
+import copy
 import json
+import re
+import warnings
 import requests
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from json import JSONDecodeError
@@ -28,21 +31,62 @@ from ..models import (
     ListingType,
     ReturnType
 )
-from .queries import GENERAL_RESULTS_QUERY, HOMES_DATA, SEARCH_SUGGESTIONS_QUERY
+from .queries import (
+    GENERAL_RESULTS_QUERY,
+    HOMES_DATA,
+    SEARCH_SUGGESTIONS_QUERY,
+    DETAIL_INSURANCE_FIELDS,
+    DETAIL_MARKET_STATS_FIELDS,
+    build_property_details_query,
+)
 from .processors import (
     process_property,
     process_extra_property_details,
     get_key
 )
+from .details import apply_details_to_property, apply_details_to_raw
+
+
+class PropertyDetailsError(Exception):
+    """Non-transient error returned by the property details query (e.g. schema mismatch)."""
+
+
+#: GraphQL selections requested for each opt-in include_* flag
+DETAIL_SELECTIONS = {
+    "insurance": DETAIL_INSURANCE_FIELDS,
+    "market_stats": DETAIL_MARKET_STATS_FIELDS,
+}
+
+_SAFE_PROPERTY_ID = re.compile(r"^[A-Za-z0-9_]+$")
 
 
 class RealtorScraper(Scraper):
     SEARCH_GQL_URL = "https://www.realtor.com/frontdoor/graphql"
     NUM_PROPERTY_WORKERS = 20
     DEFAULT_PAGE_SIZE = 200
+    DETAIL_BATCH_SIZE = 25
+    DETAIL_WORKERS = 4
+
+    #: Listing types searched when a date filter is combined with listing_type=None.
+    #: Each has a meaningful date field (list_date, sold_date, pending_date).
+    DATE_FILTER_DEFAULT_LISTING_TYPES = [
+        ListingType.FOR_SALE,
+        ListingType.FOR_RENT,
+        ListingType.SOLD,
+        ListingType.PENDING,
+    ]
 
     def __init__(self, scraper_input):
         super().__init__(scraper_input)
+        self._location_info = None
+        self._location_resolved = False
+
+    def _get_location_info(self):
+        """Resolve the search location once and reuse it (also shared with per-type sub-searches)."""
+        if not self._location_resolved:
+            self._location_info = self.handle_location()
+            self._location_resolved = True
+        return self._location_info
 
     @staticmethod
     def _minify_query(query: str) -> str:
@@ -549,7 +593,193 @@ class RealtorScraper(Scraper):
         }
 
     def search(self):
-        location_info = self.handle_location()
+        """Run the search, then apply client-side filters and opt-in enrichment."""
+        if self._should_split_listing_types():
+            homes = self._search_split_listing_types()
+        else:
+            homes = self._search_core()
+
+        homes = self._apply_post_filters(homes)
+        homes = self._enrich_with_details(homes)
+        return homes
+
+    # ------------------------------------------------------------------
+    # Multiple listing types + date filters (issue #143)
+    # ------------------------------------------------------------------
+
+    def _has_date_filter(self) -> bool:
+        return bool(self.last_x_days or self.past_hours or self.date_from or self.date_to)
+
+    def _should_split_listing_types(self) -> bool:
+        """Date filters need a per-type date field (sold_date, list_date, pending_date).
+
+        With listing_type=None or several types, the API cannot apply one date filter to all of
+        them, so each type is searched separately with its own date filter and the results merged.
+        """
+        if not self._has_date_filter():
+            return False
+        if self.listing_type is None:
+            return True
+        return isinstance(self.listing_type, list) and len(self.listing_type) > 1
+
+    def _search_split_listing_types(self):
+        listing_types = (
+            self.listing_type if isinstance(self.listing_type, list) else self.DATE_FILTER_DEFAULT_LISTING_TYPES
+        )
+        window = min(10000, self.offset + self.limit)
+        self._get_location_info()  #: resolve once; the copies below share the cached result
+
+        merged, seen = [], set()
+        for listing_type in listing_types:
+            sub = copy.copy(self)
+            sub.listing_type = listing_type
+            sub.offset = 0
+            sub.limit = window
+            if listing_type == ListingType.PENDING and not self.sort_by:
+                #: pending_date can't be filtered server-side; sort so client-side filtering is efficient
+                sub.sort_by = "pending_date"
+                sub.sort_direction = "desc"
+
+            for home in sub._search_core():
+                property_id = home.get("property_id") if isinstance(home, dict) else home.property_id
+                if property_id in seen:
+                    continue
+                seen.add(property_id)
+                merged.append(home)
+
+        if self.sort_by:
+            merged = self._apply_sort(merged)
+
+        return merged[self.offset:self.offset + self.limit]
+
+    # ------------------------------------------------------------------
+    # Client-side post filters
+    # ------------------------------------------------------------------
+
+    def _apply_post_filters(self, homes):
+        if self.mls_status:
+            homes = self._apply_mls_status_filter(homes)
+        return homes
+
+    def _apply_mls_status_filter(self, homes):
+        """Keep homes whose mls_status contains any requested value (case-insensitive).
+
+        MLS status strings vary per MLS ("Expired", "Expired Listing", "Withdrawn", ...), so a
+        substring match is used: mls_status=["expired"] matches all of them.
+        """
+        wanted = [str(v).strip().lower() for v in self.mls_status if str(v).strip()]
+        if not wanted:
+            return homes
+
+        filtered = []
+        for home in homes:
+            value = home.get("mls_status") if isinstance(home, dict) else getattr(home, "mls_status", None)
+            if value and any(w in str(value).lower() for w in wanted):
+                filtered.append(home)
+        return filtered
+
+    # ------------------------------------------------------------------
+    # Opt-in property detail enrichment
+    # ------------------------------------------------------------------
+
+    def _detail_includes(self) -> set[str]:
+        include = set()
+        if self.include_property_history:
+            include.add("property_history")
+        if self.include_environmental_risk:
+            include.add("environmental_risk")
+        if self.include_insurance:
+            include.add("insurance")
+        if self.include_market_stats:
+            include.add("market_stats")
+        return include
+
+    def _enrich_with_details(self, homes):
+        include = self._detail_includes()
+        if not include or not homes:
+            return homes
+
+        selections = [DETAIL_SELECTIONS[name] for name in sorted(include)]
+
+        property_ids = []
+        for home in homes:
+            property_id = home.get("property_id") if isinstance(home, dict) else home.property_id
+            if property_id and property_id not in property_ids:
+                property_ids.append(property_id)
+
+        details = self.get_property_details(property_ids, selections)
+
+        for home in homes:
+            if isinstance(home, dict):
+                apply_details_to_raw(home, details.get(home.get("property_id")))
+            else:
+                apply_details_to_property(home, details.get(home.property_id), include)
+
+        return homes
+
+    def get_property_details(self, property_ids: list[str], selections: list[str]) -> dict:
+        """Fetch detail selections for many properties in batched, aliased queries.
+
+        Returns {property_id: raw home detail dict}. Failures are reported as a warning so the
+        search results are still returned (just without the extra data).
+        """
+        property_ids = [pid for pid in property_ids if pid and _SAFE_PROPERTY_ID.match(str(pid))]
+        if not property_ids or not selections:
+            return {}
+
+        batches = [
+            property_ids[i:i + self.DETAIL_BATCH_SIZE]
+            for i in range(0, len(property_ids), self.DETAIL_BATCH_SIZE)
+        ]
+
+        details, errors = {}, []
+        with ThreadPoolExecutor(max_workers=self.DETAIL_WORKERS) as executor:
+            futures = [executor.submit(self._fetch_details_batch, batch, selections) for batch in batches]
+            for future in futures:
+                try:
+                    details.update(future.result())
+                except Exception as e:  # noqa: BLE001 - enrichment must never break the search
+                    errors.append(e)
+
+        if errors:
+            warnings.warn(
+                f"Could not fetch extra property details for {len(errors)} of {len(batches)} batch(es); "
+                f"those properties are returned without them. First error: {errors[0]}",
+                RuntimeWarning,
+                stacklevel=2,
+            )
+
+        return details
+
+    @retry(
+        retry=retry_if_exception_type(Exception)
+        & retry_if_not_exception_type((AuthenticationError, PropertyDetailsError)),
+        wait=wait_exponential(multiplier=1, min=1, max=8),
+        stop=stop_after_attempt(3),
+        reraise=True,
+    )
+    def _fetch_details_batch(self, property_ids: list[str], selections: list[str]) -> dict:
+        query = build_property_details_query(property_ids, selections)
+        data = self._graphql_post(query, {}, "GetPropertyDetails")
+
+        if not data or data.get("data") is None:
+            messages = [e.get("message", "") for e in (data or {}).get("errors", []) if isinstance(e, dict)]
+            if any("Cannot query field" in m or "Unknown argument" in m or "Unknown type" in m for m in messages):
+                raise PropertyDetailsError("; ".join(messages)[:500])
+            raise Exception(f"Property details query failed: {'; '.join(messages)[:500] or 'no data'}")
+
+        return {
+            key[len("home_"):]: value
+            for key, value in data["data"].items()
+            if key.startswith("home_") and value
+        }
+
+    # ------------------------------------------------------------------
+    # Core search (single listing type or a combination without date filters)
+    # ------------------------------------------------------------------
+
+    def _search_core(self):
+        location_info = self._get_location_info()
         if not location_info:
             return []
 
