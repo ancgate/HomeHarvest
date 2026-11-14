@@ -59,6 +59,7 @@ def scrape_property(
     mls_status: str | list[str] = None,
     # Keyword / feature matching (client-side, on tags + feature details + description)
     features: str | list[str] = None,
+    nearby: str | list[str] = None,
     keywords: str | list[str] = None,
     match_mode: str = "any",
     # Opt-in extra data (each costs extra batched requests)
@@ -122,10 +123,14 @@ def scrape_property(
     :param features: Named listing features, e.g. ["cul_de_sac", "corner_lot", "pool"]. Matched against the
         listing's tags, feature details and description. Use "likely_cul_de_sac" to also include streets whose
         suffix usually means a cul-de-sac (Ct, Court, Cir, Cove).
+    :param nearby: Land / surroundings categories: farms_and_ranches, hunting, timberland, undeveloped,
+        recreational, commercial, horse, homesite, house, lakefront, riverfront, oceanfront, waterfront
+        (waterfront = lakefront, riverfront, oceanfront or canal front). Pair with property_type=["land", "farm"].
     :param keywords: Free-text keywords, e.g. ["cul de sac", "seawall"]. Punctuation/spacing tolerant.
     :param match_mode: "any" (default) keeps listings matching at least one term of each group given
-        (features, keywords); "all" requires every term. Matching listings get matched_features,
-        matched_keywords and feature_evidence (why it matched) columns.
+        (features, nearby, keywords); "all" requires every term. Groups are combined with AND, e.g.
+        features=["cul_de_sac"], nearby=["lakefront", "riverfront"] = cul-de-sac AND (lake OR river).
+        Matching listings get matched_features, matched_keywords and feature_evidence (why it matched) columns.
         Note: matching is client-side, so it filters the (up to `limit`) listings returned by the search.
 
     Opt-in extra data (False by default; each adds batched requests for the returned properties):
@@ -149,7 +154,7 @@ def scrape_property(
         mls_status = [mls_status]
 
     #: validate feature keys / match mode up front (raises ValueError with suggestions)
-    feature_matcher = FeatureMatcher(features=features, keywords=keywords, match_mode=match_mode)
+    feature_matcher = FeatureMatcher(features=features, nearby=nearby, keywords=keywords, match_mode=match_mode)
 
     # Validate new last_update_date filtering parameters
     validate_last_update_filters(
@@ -237,6 +242,7 @@ def scrape_property(
         parallel=parallel,
         mls_status=mls_status,
         features=feature_matcher.features or None,
+        nearby=feature_matcher.nearby or None,
         keywords=feature_matcher.keywords or None,
         match_mode=match_mode,
         include_insurance=include_insurance,

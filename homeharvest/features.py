@@ -270,16 +270,22 @@ class FeatureDefinition:
     styles: tuple[str, ...] = ()
     includes: tuple[str, ...] = ()
     predicate: Callable[[ListingView], str | None] | None = None
+    exclude_phrases: tuple[str, ...] = ()
 
 
 FEATURES: dict[str, FeatureDefinition] = {}
 _COMPILED: dict[str, tuple[re.Pattern, ...]] = {}
+_EXCLUDES: dict[str, tuple[re.Pattern, ...]] = {}
 
 
 def register_feature(definition: FeatureDefinition) -> FeatureDefinition:
-    """Add (or replace) a feature in the catalog. Useful for custom, reusable features."""
+    """Add (or replace) a feature in the catalog. Useful for custom, reusable features.
+
+    ``exclude_phrases`` are look-alikes that must not count, e.g. "ranch style" for ranches.
+    """
     FEATURES[definition.key] = definition
     _COMPILED[definition.key] = tuple(_phrase_regex(p) for p in definition.phrases)
+    _EXCLUDES[definition.key] = tuple(_phrase_regex(p) for p in definition.exclude_phrases)
     return definition
 
 
@@ -424,6 +430,135 @@ for _definition in (
     register_feature(_definition)
 
 
+# --- "nearby" / land categories --------------------------------------------------
+
+_RESIDENTIAL_STYLES = {
+    "SINGLE_FAMILY", "MULTI_FAMILY", "CONDO", "CONDOS", "CONDOP", "COOP", "TOWNHOMES", "CONDO_TOWNHOME",
+    "CONDO_TOWNHOME_ROWHOME_COOP", "DUPLEX_TRIPLEX", "MOBILE", "APARTMENT",
+}
+
+
+def _has_structure(view: ListingView) -> bool:
+    return bool((view.beds or 0) > 0 or (view.sqft or 0) > 0 or (view.style in _RESIDENTIAL_STYLES))
+
+
+def _house(view: ListingView) -> str | None:
+    if not _has_structure(view):
+        return None
+    facts = [f"{int(view.beds)} beds" if view.beds else None, f"{int(view.sqft):,} sqft" if view.sqft else None]
+    facts = [f for f in facts if f]
+    return f"has a home ({', '.join(facts)})" if facts else f"has a home ({view.style})"
+
+
+def _undeveloped(view: ListingView) -> str | None:
+    if view.style in ("LAND", "FARM") and not ((view.beds or 0) > 0 or (view.sqft or 0) > 0):
+        return f"{view.style.lower()} listing with no structure"
+    return None
+
+
+for _definition in (
+    FeatureDefinition(
+        "farms_and_ranches", "Farms & ranches", "nearby",
+        "Farm, ranch or agricultural land (pasture, crops, livestock, groves).",
+        phrases=("farm", "farmland", "ranch", "ranchette", "agricultural", "agriculture", "ag land", "ag exempt",
+                 "ag exemption", "agricultural exemption", "pasture", "cattle", "livestock", "crops", "cropland",
+                 "orchard", "citrus grove", "orange grove", "pecan grove", "olive grove", "hay field", "barn"),
+        tags=("farm", "ranch", "farm_and_ranch"),
+        styles=("FARM",),
+        exclude_phrases=("ranch style", "ranch home", "ranch house", "ranch floor plan", "ranch layout",
+                         "barn door", "farm sink", "farm table", "farm style sink"),
+    ),
+    FeatureDefinition(
+        "hunting", "Hunting land", "nearby", "Hunting land or abundant game (deer, turkey, waterfowl...).",
+        phrases=("hunting", "hunt", "hunter", "deer", "turkey", "wild game", "big game", "game animals", "elk",
+                 "waterfowl", "duck hunting", "dove field", "quail", "wild hogs", "hog hunting", "food plot",
+                 "deer stand", "tree stand", "hunting camp", "hunting lease", "wildlife management area"),
+        exclude_phrases=("deer park", "deer creek", "deer run", "turkey creek", "hunters creek", "hunters ridge",
+                         "fox hunt", "treasure hunt", "house hunt", "home hunt", "turkey trot"),
+    ),
+    FeatureDefinition(
+        "timberland", "Timberland", "nearby", "Timber, woods or forest land.",
+        phrases=("timber", "timberland", "merchantable timber", "wooded", "heavily wooded", "woods", "woodland",
+                 "forest", "forested", "hardwood timber", "hardwood trees", "mature hardwoods", "pine trees",
+                 "planted pines", "pine plantation", "tree farm", "cypress trees", "national forest"),
+        exclude_phrases=("forest hills", "forest park", "timber frame", "wood floors", "woods floors"),
+    ),
+    FeatureDefinition(
+        "undeveloped", "Undeveloped land", "nearby", "Vacant / raw / unimproved land (no structure).",
+        phrases=("undeveloped", "vacant land", "vacant lot", "vacant acreage", "raw land", "unimproved",
+                 "empty lot", "bare land", "land only", "lot only"),
+        predicate=_undeveloped,
+    ),
+    FeatureDefinition(
+        "recreational", "Recreational property", "nearby",
+        "Recreational land: camping, RV, ATV, fishing, hiking, cabins, getaways.",
+        phrases=("recreational", "recreation", "camping", "campsite", "rv", "atv", "off road", "fishing",
+                 "hiking", "hiking trails", "getaway", "weekend getaway", "retreat", "cabin", "off grid", "boating",
+                 "kayak", "kayaking", "canoe", "nature preserve", "state park", "national forest"),
+        exclude_phrases=("recreation room", "rec room", "rv parking", "corporate retreat"),
+    ),
+    FeatureDefinition(
+        "commercial", "Commercial property", "nearby", "Commercial / mixed-use / industrial property.",
+        phrases=("commercial", "zoned commercial", "commercial zoning", "mixed use", "industrial", "warehouse",
+                 "office building", "office space", "retail space", "retail center", "retail building",
+                 "zoned retail", "business opportunity", "income producing", "highway frontage", "strip center",
+                 "c 1 zoning", "c 2 zoning", "zoned c 1", "zoned c 2", "cpd zoning"),
+        styles=("COMMERCIAL", "INDUSTRIAL"),
+        exclude_phrases=("commercial grade", "commercial appliances", "commercial kitchen appliances",
+                         "industrial style", "industrial chic", "close to commercial", "near commercial"),
+    ),
+    FeatureDefinition(
+        "horse", "Horse property", "nearby", "Horse / equestrian property.",
+        phrases=("horse", "equestrian", "equine", "horse property", "horse barn", "horse stalls", "paddock",
+                 "riding arena", "horse arena", "round pen", "stables", "horse farm", "bridle path", "horse trails"),
+        tags=("horse_facilities", "horse_property"),
+        exclude_phrases=("horse shoe", "rocking horse", "horsepower"),
+    ),
+    FeatureDefinition(
+        "homesite", "Homesite", "nearby", "Buildable lot / homesite ready for a home.",
+        phrases=("homesite", "home site", "building site", "building lot", "buildable lot", "buildable",
+                 "build your dream home", "build your dream", "build your home", "build your house",
+                 "ready to build", "residential lot", "single family lot", "perfect lot to build",
+                 "approved for building", "permit ready"),
+    ),
+    FeatureDefinition(
+        "house", "House", "nearby", "Property includes a home (has beds/sqft or a residential style).",
+        phrases=("existing home", "existing house", "includes a home", "includes a house", "home included",
+                 "mobile home", "manufactured home"),
+        predicate=_house,
+    ),
+    FeatureDefinition(
+        "lakefront", "Lakefront", "nearby", "On or with access to a lake.",
+        phrases=("lakefront", "lake front", "lakeside", "on the lake", "lake frontage", "lake access",
+                 "private lake", "waterfront lake", "lakefront property"),
+        tags=("lakefront", "lake_front", "lake_access"),
+    ),
+    FeatureDefinition(
+        "riverfront", "Riverfront", "nearby", "On or with access to a river or creek.",
+        phrases=("riverfront", "river front", "on the river", "river frontage", "river access", "creekfront",
+                 "creek front", "creek frontage", "on the creek", "creek runs through", "stream frontage",
+                 "streamfront", "bayou frontage"),
+        tags=("riverfront", "river_front", "river_access"),
+    ),
+    FeatureDefinition(
+        "oceanfront", "Oceanfront", "nearby", "On or with access to the ocean, gulf, bay or beach.",
+        phrases=("oceanfront", "ocean front", "beachfront", "beach front", "gulf front", "gulffront", "bayfront",
+                 "bay front", "on the ocean", "on the beach", "ocean access", "beach access", "direct ocean",
+                 "sound front", "intracoastal"),
+        tags=("oceanfront", "beachfront", "beach_front", "ocean_front"),
+    ),
+    FeatureDefinition(
+        "waterfront", "Waterfront", "nearby",
+        "Any waterfront: lakefront, riverfront, oceanfront, canal front, ponds, docks and seawalls.",
+        phrases=("waterfront", "water front", "on the water", "water frontage", "seawall", "sea wall", "boat dock",
+                 "private dock", "boat lift", "pond front", "pondfront", "on the pond"),
+        tags=("waterfront", "water_front"),
+        includes=("lakefront", "riverfront", "oceanfront", "canal_front"),
+    ),
+):
+    register_feature(_definition)
+
+
 def list_features(group: str | None = None) -> list[dict]:
     """Return the feature catalog as a list of dicts (key, label, group, description)."""
     return [
@@ -482,13 +617,21 @@ class MatchResult:
         return bool(self.features or self.keywords)
 
 
-def _match_text_sources(regexes: tuple[re.Pattern, ...], view: ListingView) -> str | None:
+def _mask(text: str, excludes: tuple[re.Pattern, ...]) -> str:
+    """Blank out excluded look-alike phrases, keeping offsets so snippets still line up."""
+    for regex in excludes:
+        text = regex.sub(lambda m: " " * len(m.group(0)), text)
+    return text
+
+
+def _match_text_sources(regexes: tuple[re.Pattern, ...], view: ListingView,
+                        excludes: tuple[re.Pattern, ...] = ()) -> str | None:
     if not regexes:
         return None
-    if view.text and (span := _find_phrase(regexes, view.text)):
+    if view.text and (span := _find_phrase(regexes, _mask(view.text, excludes))):
         return f'description: "{_snippet(view.text, *span)}"'
     for detail in view.details:
-        if span := _find_phrase(regexes, detail):
+        if span := _find_phrase(regexes, _mask(detail, excludes)):
             return f'details: "{_snippet(detail, *span, width=60)}"'
     return None
 
@@ -507,7 +650,7 @@ def _match_feature(key: str, view: ListingView, _seen: set[str] | None = None) -
             if _normalize_tag(tag) in wanted:
                 return f'tag "{tag}"'
 
-    if evidence := _match_text_sources(_COMPILED.get(key, ()), view):
+    if evidence := _match_text_sources(_COMPILED.get(key, ()), view, _EXCLUDES.get(key, ())):
         return evidence
 
     if definition.styles and view.style in definition.styles:
