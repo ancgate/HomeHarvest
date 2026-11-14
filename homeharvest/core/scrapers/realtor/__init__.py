@@ -11,7 +11,6 @@ import copy
 import json
 import re
 import warnings
-import requests
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from json import JSONDecodeError
 from typing import Dict, Union
@@ -25,7 +24,8 @@ from tenacity import (
 )
 
 from .. import Scraper, DEFAULT_HEADERS
-from ....exceptions import AuthenticationError
+from ...client import PoliteClient
+from ....exceptions import AuthenticationError, BlockedError, NetworkError, RequestFailedError
 from ..models import (
     Property,
     ListingType,
@@ -72,6 +72,7 @@ class RealtorScraper(Scraper):
     DEFAULT_PAGE_SIZE = 200
     DETAIL_BATCH_SIZE = 25
     DETAIL_WORKERS = 4
+    PAGE_WORKERS = 4
 
     #: Listing types searched when a date filter is combined with listing_type=None.
     #: Each has a meaningful date field (list_date, sold_date, pending_date).
@@ -86,6 +87,14 @@ class RealtorScraper(Scraper):
         super().__init__(scraper_input)
         self._location_info = None
         self._location_resolved = False
+        #: shared by copies made for sub-searches, so they share retries, sessions and block detection
+        self.client = PoliteClient(
+            base_url=self.SEARCH_GQL_URL,
+            requests_per_second=self.requests_per_second,
+            max_retries=self.max_retries,
+            proxies=self.proxies,
+            headers=DEFAULT_HEADERS,
+        )
 
     def _get_location_info(self):
         """Resolve the search location once and reuse it (also shared with per-type sub-searches)."""
@@ -118,28 +127,15 @@ class RealtorScraper(Scraper):
             "variables": variables,
         }
 
-        response = requests.post(
-            self.SEARCH_GQL_URL,
-            headers=DEFAULT_HEADERS,
-            data=json.dumps(payload, separators=(',', ':')),
-            proxies=self.proxies
-        )
-
-        if response.status_code == 403:
-            if not self.proxy:
-                raise AuthenticationError(
-                    "Received 403 Forbidden from Realtor.com API.",
-                    response=response
-                )
-            else:
-                raise Exception("Received 403 Forbidden, retrying...")
-
-        return response.json()
+        #: rate limit, retries, block detection and outage handling live in PoliteClient
+        return self.client.post_json(self.SEARCH_GQL_URL, json.dumps(payload, separators=(',', ':')))
 
     @retry(
-        retry=retry_if_exception_type(Exception),
+        retry=retry_if_exception_type(Exception)
+        & retry_if_not_exception_type((AuthenticationError, NetworkError, RequestFailedError)),
         wait=wait_exponential(multiplier=1, min=1, max=4),
         stop=stop_after_attempt(3),
+        reraise=True,
     )
     def handle_location(self):
         variables = {
@@ -753,6 +749,12 @@ class RealtorScraper(Scraper):
             for future in futures:
                 try:
                     details.update(future.result())
+                except (BlockedError, NetworkError) as e:
+                    #: blocked or offline: stop sending requests, keep the search results we already have
+                    for pending in futures:
+                        pending.cancel()
+                    errors.append(e)
+                    break
                 except Exception as e:  # noqa: BLE001 - enrichment must never break the search
                     errors.append(e)
 
@@ -768,7 +770,7 @@ class RealtorScraper(Scraper):
 
     @retry(
         retry=retry_if_exception_type(Exception)
-        & retry_if_not_exception_type((AuthenticationError, PropertyDetailsError)),
+        & retry_if_not_exception_type((AuthenticationError, PropertyDetailsError, NetworkError, RequestFailedError)),
         wait=wait_exponential(multiplier=1, min=1, max=8),
         stop=stop_after_attempt(3),
         reraise=True,
@@ -869,7 +871,7 @@ class RealtorScraper(Scraper):
         if self.offset + self.DEFAULT_PAGE_SIZE < min(total, self.offset + self.limit):
             if self.parallel:
                 # Parallel mode: Fetch all remaining pages in parallel
-                with ThreadPoolExecutor() as executor:
+                with ThreadPoolExecutor(max_workers=self.PAGE_WORKERS) as executor:
                     futures_with_offsets = [
                         (i, executor.submit(
                             self.general_search,
@@ -1377,7 +1379,8 @@ class RealtorScraper(Scraper):
 
 
     @retry(
-        retry=retry_if_exception_type((JSONDecodeError, Exception)) & retry_if_not_exception_type(AuthenticationError),
+        retry=retry_if_exception_type((JSONDecodeError, Exception))
+        & retry_if_not_exception_type((AuthenticationError, NetworkError, RequestFailedError)),
         wait=wait_exponential(multiplier=1, min=1, max=10),
         stop=stop_after_attempt(3),
     )

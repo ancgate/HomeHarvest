@@ -92,6 +92,10 @@ class ScraperInput(BaseModel):
     include_insurance: bool = False
     include_market_stats: bool = False
 
+    # Polite request handling
+    requests_per_second: float | None = 2.0
+    max_retries: int = 4
+
 
 class Scraper:
     def __init__(
@@ -164,6 +168,10 @@ class Scraper:
         self.include_environmental_risk = scraper_input.include_environmental_risk
         self.include_insurance = scraper_input.include_insurance
         self.include_market_stats = scraper_input.include_market_stats
+
+        # Polite request handling
+        self.requests_per_second = scraper_input.requests_per_second
+        self.max_retries = scraper_input.max_retries
 
     def search(self) -> list[Union[Property | dict]]: ...
 

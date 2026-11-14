@@ -17,6 +17,7 @@ from .locations import (
     get_states, get_state, get_counties, get_cities, get_zip_codes, get_location_hierarchy, aggregate_locations
 )
 from .core.scrapers.models import ListingType, SearchPropertyType, ReturnType, Property
+from .exceptions import AuthenticationError, BlockedError, NetworkError, RequestFailedError
 from typing import Union, Optional, List
 
 def scrape_property(
@@ -70,6 +71,9 @@ def scrape_property(
     include_environmental_risk: bool = False,
     include_insurance: bool = False,
     include_market_stats: bool = False,
+    # Polite request handling
+    requests_per_second: float | None = 2.0,
+    max_retries: int = 4,
 ) -> Union[pd.DataFrame, list[dict], list[Property]]:
     """
     Scrape properties from Realtor.com based on a given location and listing type.
@@ -148,6 +152,13 @@ def scrape_property(
     :param include_market_stats: Realtor.com rent estimate plus neighborhood and ZIP medians
         (median rent, listing price, sold price, price per sqft, days on market).
 
+    Polite request handling:
+    :param requests_per_second: Shared rate limit for all requests to Realtor.com in this process
+        (default 2.0, with +/-20% jitter). None or 0 disables it.
+    :param max_retries: Attempts per request for HTTP 403/429/5xx and bot-challenge answers, with
+        exponential backoff (honors Retry-After). After 10 consecutive failures BlockedError is raised;
+        network outages are waited out for 3 minutes before NetworkError.
+
     Note: past_days and past_hours also accept timedelta objects for more Pythonic usage.
     """
     validate_input(listing_type)
@@ -161,6 +172,10 @@ def scrape_property(
 
     if isinstance(mls_status, str):
         mls_status = [mls_status]
+    if requests_per_second is not None and requests_per_second < 0:
+        raise ValueError("requests_per_second must be positive, or None/0 to disable the rate limit.")
+    if max_retries < 1:
+        raise ValueError("max_retries must be at least 1.")
 
     #: validate feature keys / match mode up front (raises ValueError with suggestions)
     feature_matcher = FeatureMatcher(features=features, nearby=nearby, keywords=keywords, match_mode=match_mode)
@@ -258,6 +273,8 @@ def scrape_property(
         match_mode=match_mode,
         include_insurance=include_insurance,
         include_market_stats=include_market_stats,
+        requests_per_second=requests_per_second,
+        max_retries=max_retries,
     )
 
     site = RealtorScraper(scraper_input)

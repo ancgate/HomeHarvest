@@ -12,3 +12,23 @@ class AuthenticationError(Exception):
         super().__init__(*args)
 
         self.response = response
+
+
+class BlockedError(AuthenticationError):
+    """Raised after too many consecutive failed requests: the site is most likely blocking us.
+
+    Subclass of AuthenticationError so existing ``except AuthenticationError`` handlers still work.
+    Wait a while, lower ``requests_per_second`` or use a proxy.
+    """
+
+
+class NetworkError(Exception):
+    """Raised when the network stayed unreachable for longer than the grace period."""
+
+
+class RequestFailedError(Exception):
+    """Raised when a request still fails after all retries (HTTP 5xx/429, bad response...)."""
+
+    def __init__(self, *args, response=None):
+        super().__init__(*args)
+        self.response = response
