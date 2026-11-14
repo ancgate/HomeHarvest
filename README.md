@@ -16,8 +16,11 @@
 - **Sorting**: Sort results by price, date, size, or last update
 - **Feature & Keyword Search**: Find listings on a cul-de-sac, corner lot, with a pool, ... or any free-text keyword
 - **Land Categories**: Farms & ranches, hunting, timberland, lakefront, riverfront, oceanfront, waterfront, ...
+- **Real Distances (OpenStreetMap)**: Filter or annotate by distance to cul-de-sacs, water, paved roads, schools, power lines, ...
+- **No 10,000-Result Ceiling**: `limit=None` splits big searches automatically by listing type, price and sold date
+- **Polite Requests**: Shared rate limit, retries with backoff, block detection and outage handling
 - **Maps**: Export to OpenStreetMap (HTML), Google Maps, KML (Google Earth / My Maps), CSV and GeoJSON, with clustering and highlighted matches
-- **Location Lists**: States, counties, cities and ZIP codes, plus location roll-ups of your results
+- **Location Lists**: States, counties, cities and ZIP codes, city/town/village types, plus location roll-ups of your results
 - **Opt-in Extra Data**: Property history, environmental risk (flood, fire, heat, wind, air), insurance estimates, rent estimates and neighborhood medians
 
 ![homeharvest](https://github.com/ZacharyHampton/HomeHarvest/assets/78247585/b3d5d727-e67b-4a9f-85d8-1e65fd18620a)
@@ -118,6 +121,38 @@ properties = scrape_property(location="Warren, MI", past_days=1)  # for_sale, fo
 properties = scrape_property(location="Warren, MI", listing_type=["for_sale", "sold"], past_days=7)
 ```
 
+#### More Than 10,000 Results
+Realtor.com returns at most 10,000 results per search. With `limit=None` (or any limit above 10,000) HomeHarvest
+splits the search automatically and merges the pieces (duplicates removed):
+
+1. one search per listing type, when several are requested;
+2. **for sale / for rent / pending**: price bands ($0-50k, 50-100k, 100-250k, 250-500k, 500k-1M, 1-2.5M, 2.5-5M,
+   5M+, within your `price_min`/`price_max`), each halved until it fits;
+3. **sold**: sold-date ranges (from `past_days` / `date_from`-`date_to`, else since 1990), halved until they fit.
+
+```py
+everything = scrape_property(location="Florida", listing_type="for_sale", property_type=["land"], limit=None)
+```
+
+Off-market searches can't be split and stop at 10,000 with a warning, as does a single price (or day) shared by
+more than 10,000 listings. Listings without a list price (some apartment rentals) are missed by price bands.
+A whole-state search can take many requests; at the default rate of 2 requests/second that's minutes, not seconds.
+
+#### Polite Requests
+Every request to Realtor.com goes through one rate limiter shared by all threads and searches in the process.
+
+```py
+properties = scrape_property(
+    location="Austin, TX",
+    requests_per_second=1.0,  # default 2.0 (+/-20% jitter); None disables the limit
+    max_retries=4,            # attempts for HTTP 403/429/5xx and bot-challenge answers (exponential backoff)
+)
+```
+
+Requests time out after 30 s, failed connections get a fresh session, and `Retry-After` is honored. After 10
+consecutive failures `BlockedError` is raised instead of hammering on. Network outages are waited out for 3 minutes
+before `NetworkError`. If an opt-in `include_*` lookup is blocked, the search results are still returned.
+
 ### Feature & Keyword Search (cul-de-sac, corner lot, pool, ...)
 
 Realtor.com has no "cul-de-sac" filter, but listings mention it in their tags, feature details or description.
@@ -181,6 +216,47 @@ properties = scrape_property(
 
 `features`, `nearby` and `keywords` are separate groups combined with **AND**; `match_mode` applies inside each group.
 Look-alikes are ignored: a "ranch style home with barn doors" is not a ranch, "Hunters Creek" is not hunting land.
+
+### Real Distances to Nearby Features (OpenStreetMap)
+
+`features=` and `nearby=` read what the **listing says**. `near=` and `far_from=` measure **real distances** to
+features mapped in OpenStreetMap, so a lot 109 ft from a cul-de-sac matches even if its listing never says so.
+
+```py
+from homeharvest import scrape_property, add_nearby, list_aspects
+
+land = scrape_property(
+    location="Lehigh Acres, FL",
+    property_type=["land"],
+    near={"cul_de_sac": "300 ft", "paved_road": 100},  # within 300 ft of a cul-de-sac AND 100 ft of a paved road
+    far_from={"power_line": "500 ft"},                  # and nothing within 500 ft of a power line
+)
+print(land[["formatted_address", "list_price", "cul_de_sac_ft", "cul_de_sac_name", "power_line_ft"]])
+
+# Annotate without filtering (never drops rows); works on any DataFrame with latitude/longitude
+df = add_nearby(df, ["water", "school", "grocery", "hospital"])          # water_ft, water_name, school_ft, ...
+df = add_nearby(df, {"marina": "10 mi", "leisure=dog_park": "1 mi"})     # max distance per aspect, raw OSM tags
+print(list_aspects())                                                   # every aspect and its default radius
+```
+
+| Aspects | |
+|---|---|
+| Streets | `cul_de_sac` (turning circles), `dead_end`, `road`, `paved_road`, `dirt_road`, `major_road`, `freeway` |
+| Water | `water`, `lake`, `river`, `canal`, `coastline`, `beach`, `wetland`, `boat_ramp`, `marina` |
+| Land | `park`, `protected_area` (state/national forests, wildlife areas), `forest`, `golf_course` |
+| Services | `school`, `hospital`, `fire_station`, `grocery`, `gas_station`, `town`, `airport` |
+| Nuisances | `railroad`, `power_line`, `substation`, `cell_tower`, `landfill`, `industrial`, `cemetery` |
+| Anything else | a raw OSM tag: `"leisure=marina"`, `"sport~tennis\|pickleball"`, `"amenity=*"` |
+
+- Distances are in feet: numbers are feet, strings may use `ft`, `mi`, `m`, `km`, `yd`. A list (`near=["water"]`)
+  uses each aspect's default radius. Inside an area (a park, a lake) counts as 0 ft.
+- Columns: `<aspect>_ft` (None = nothing within the radius) and `<aspect>_name`; `prop.nearby` with pydantic,
+  `"nearby"` with raw. Distances also show in map popups.
+- Proximity runs after the other filters (and after `limit`), so filter by location/type/price first.
+- It uses the public Overpass API (at most 1 query/second, 80 listings per query, answers cached for 7 days in
+  `~/.cache/homeharvest`). Set `overpass_url=` or `HOMEHARVEST_OVERPASS_URL` for another server, and
+  `HOMEHARVEST_CACHE=off` to disable the cache.
+- Results are only as complete as OpenStreetMap: a cul-de-sac without a mapped turning circle isn't found.
 
 ### Opt-in Extra Data (`True` / `False`)
 
@@ -270,6 +346,7 @@ get_counties("Florida", with_counts=True)       # DataFrame: county, listing_cou
 get_cities("FL", county="Lee")                  # cities/towns in Lee County, e.g. Cape Coral, Fort Myers, Lehigh Acres
 get_zip_codes(state="FL", city="Lehigh Acres")  # ZIP codes with listings in Lehigh Acres
 get_location_hierarchy("FL", county="Lee")      # rows: state, state_name, county, city, zip_code, listing_count
+get_cities("FL", county="Lee", place_type=True)  # + place_type, municipal_type, incorporated, population
 
 df = scrape_property(location="Lee County, FL", listing_type="for_sale")
 aggregate_locations(df)                         # state > county > city > ZIP: counts per status, median prices, ...
@@ -280,6 +357,23 @@ aggregate_locations(df, as_tree=True)           # {'FL': {'Lee': {'Lehigh Acres'
 Counties, cities and ZIP codes come from Realtor.com and include places that have listings (pass
 `listing_type=` to count only some types). Realtor.com files towns, villages and census-designated places
 (such as Lehigh Acres) under **city**.
+
+**City, town or village?** `add_place_types()` tells them apart using OpenStreetMap. It works on any DataFrame
+with `city` and `state` columns (search results, `get_cities`, `aggregate_locations`, ...):
+
+```py
+from homeharvest import add_place_types
+
+places = add_place_types(aggregate_locations(df, by=["state", "city"]))
+# Illustrative output (the values come from OpenStreetMap at run time):
+#  city          place_type  municipal_type  incorporated  population
+#  Fort Myers    city        city            True          ...
+#  Lehigh Acres  town        <NA>            False         ...   <- census-designated place (unincorporated)
+```
+
+- `place_type`: OpenStreetMap's settlement class by size (city / town / village / hamlet ...).
+- `municipal_type`: the legal type of the place's municipal boundary (city / town / village / borough), if any.
+- `incorporated`: `True` if it has its own municipal boundary, `False` for unincorporated places, `<NA>` if not found.
 
 ### Expired / Withdrawn Listings
 ```py
@@ -298,12 +392,13 @@ land = scrape_property(
     location="Lehigh Acres, FL",
     listing_type="for_sale",
     property_type=["land"],
-    features=["cul_de_sac", "likely_cul_de_sac"],  # mentioned in the listing, or on a Ct / Court / Cir / Cove
-    include_environmental_risk=True,                # flood, fire, heat, wind, air (opt-in)
+    limit=None,                          # every lot: big searches are split automatically
+    near={"cul_de_sac": "300 ft"},       # real distance to a mapped cul-de-sac (OpenStreetMap)
+    include_environmental_risk=True,     # flood, fire, heat, wind, air - fetched only for the matches
 )
 
 columns = [
-    "formatted_address", "list_price", "lot_sqft", "matched_features", "feature_evidence",
+    "formatted_address", "list_price", "lot_sqft", "cul_de_sac_ft", "cul_de_sac_name",
     "flood_factor_severity", "flood_fema_zone", "flood_insurance_requirement",
     "fire_factor_severity", "heat_factor_severity", "wind_factor_severity", "air_factor_severity",
     "property_url",
@@ -319,9 +414,16 @@ to_kml(land, "lehigh_cul_de_sac_land.kml", cluster_by="zip_code")
 land.to_csv("lehigh_cul_de_sac_land.csv", index=False)
 ```
 
-Use `features=["cul_de_sac"]` alone for listings that explicitly mention a cul-de-sac. To see *every* lot and only
-highlight the cul-de-sac ones, scrape without `features` and pass them to the map instead:
-`to_osm_map(all_land, "map.html", features=["cul_de_sac"], near_matches_miles=0.25)`.
+Two ways to say "near a cul-de-sac", which you can combine:
+
+- `near={"cul_de_sac": "300 ft"}` measures the distance to turning circles mapped in OpenStreetMap. It finds lots
+  whose listing never mentions a cul-de-sac, but misses cul-de-sacs that aren't mapped.
+- `features=["cul_de_sac"]` keeps listings that **say** they're on a cul-de-sac; `features=["likely_cul_de_sac"]`
+  also accepts streets ending in Ct / Court / Cir / Cove.
+
+To see *every* lot and only highlight the cul-de-sac ones, scrape without the filter and pass it to the map:
+`to_osm_map(all_land, "map.html", features=["cul_de_sac"], near_matches_miles=0.25)`, or add the distance column with
+`add_nearby(all_land, ["cul_de_sac"])`.
 
 ### Scenario 2: Houses in Missouri City and their property details
 
@@ -522,9 +624,11 @@ Optional
 │
 ├── exclude_pending (True/False): If set, excludes 'pending' properties from the 'for_sale' results unless listing_type is 'pending'
 │
-├── limit (integer): Limit the number of properties to fetch. Max & default is 10000.
+├── limit (integer | None): Limit the number of properties to fetch. Default 10000. None (or more than 10,000)
+│    collects everything by splitting the search automatically (listing type, price bands, sold-date ranges).
 │
-├── offset (integer): Starting position for pagination within the 10k limit. Use with limit to fetch results in chunks.
+├── offset (integer): Starting position for pagination within one 10,000-result window. Use with limit to fetch
+│    results in chunks; can't be combined with limit=None.
 │
 ├── parallel (True/False): Controls pagination strategy. Default is True (fetch pages in parallel for speed). Set to False for sequential fetching with early termination (useful for rate limiting or narrow time windows).
 │
@@ -542,7 +646,16 @@ Opt-in extra data (False by default; batched extra requests for the returned pro
 ├── include_property_history (True/False): History events, original list price, price changes, buyer agent
 ├── include_environmental_risk (True/False): Flood, wildfire, heat, wind, air risk; FEMA zone; noise
 ├── include_insurance (True/False): Homeowner's insurance estimate, tax/insurance rates, flood/fire quotes
-└── include_market_stats (True/False): Rent estimate, neighborhood and ZIP medians
+├── include_market_stats (True/False): Rent estimate, neighborhood and ZIP medians
+│
+Real distances (OpenStreetMap; adds <aspect>_ft and <aspect>_name columns)
+├── near (dict | list | str): Keep listings within a distance of every aspect, e.g. {"cul_de_sac": "300 ft"}
+├── far_from (dict | list | str): Keep listings with no such feature within the distance, e.g. {"power_line": 500}
+├── overpass_url (string): Another Overpass API endpoint
+│
+Polite requests
+├── requests_per_second (float | None): Shared rate limit for Realtor.com, default 2.0. None disables it.
+└── max_retries (integer): Attempts per request for 403/429/5xx and bot challenges, default 4
 ```
 
 ### Property Schema
@@ -654,6 +767,16 @@ Property
 │ ├── neighborhood_median_rent_price / _listing_price / _sold_price / _price_per_sqft / _days_on_market
 │ └── zip_median_rent_price / zip_median_listing_price / zip_median_sold_price
 
+├── Nearby Features (near / far_from / add_nearby):
+│ ├── <aspect>_ft  # e.g. cul_de_sac_ft: feet to the nearest one (None = none within the radius)
+│ └── <aspect>_name  # e.g. cul_de_sac_name: its OpenStreetMap name
+
+├── Place Types (add_place_types / get_cities(place_type=True)):
+│ ├── place_type  # city / town / village / hamlet (OpenStreetMap)
+│ ├── municipal_type  # legal type of the municipal boundary
+│ ├── incorporated
+│ └── population
+
 ├── Agent/Broker/Office Info (Pydantic/Raw):
 │ ├── agent_uuid
 │ ├── agent_name  
@@ -690,14 +813,20 @@ The following exceptions may be raised when using HomeHarvest:
 - `InvalidListingType` - valid options: `for_sale`, `for_rent`, `sold`, `pending`.
 - `InvalidDate` - date_from or date_to is not in the format YYYY-MM-DD.
 - `AuthenticationError` - Realtor.com token request failed.
-- `ValueError` - e.g. an unknown `features` / `nearby` value (the message suggests the closest match).
+- `ValueError` - e.g. an unknown `features` / `nearby` / `near` value (the message suggests the closest match).
+- `BlockedError` (a subclass of `AuthenticationError`) - 10 consecutive failed requests: Realtor.com is most likely
+  blocking you. Wait, lower `requests_per_second` or use a `proxy`.
+- `NetworkError` - the network stayed unreachable for 3 minutes.
+- `RequestFailedError` - a request still failed after `max_retries` attempts.
+- `OverpassError` - the OpenStreetMap Overpass API kept failing (busy server); try later or set `overpass_url`.
 
 If an opt-in `include_*` request fails, the search results are still returned (without that data) and a
 `RuntimeWarning` explains what went wrong.
 
 ### Limitations
 - Feature / keyword / category matching uses what the listing says (tags, feature details, description), so a
-  listing that never mentions a cul-de-sac won't match `cul_de_sac`. `likely_cul_de_sac` widens it with street names.
+  listing that never mentions a cul-de-sac won't match `cul_de_sac`. `likely_cul_de_sac` widens it with street names,
+  and `near={"cul_de_sac": ...}` measures real distances instead (as complete as OpenStreetMap's map data).
 - Realtor.com does not list For Sale By Owner (FSBO) properties.
 - Expired listings depend on the MLS status Realtor.com keeps for off-market properties.
 

@@ -24,7 +24,7 @@ import random
 import tempfile
 import time
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Iterable
 
 import requests
 

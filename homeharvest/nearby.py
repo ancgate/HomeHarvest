@@ -22,7 +22,7 @@ import difflib
 import re
 import warnings
 from dataclasses import dataclass
-from typing import Any, Iterable
+from typing import Any
 
 from .osm import (
     FEET_PER_METER,
