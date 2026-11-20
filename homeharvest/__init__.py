@@ -8,6 +8,7 @@ from .utils import (
     convert_to_datetime_string, extract_timedelta_hours, extract_timedelta_days, detect_precision_and_convert
 )
 from .core.scrapers.realtor import RealtorScraper
+from ._context import SEARCH_STATS
 from .features import FeatureMatcher, filter_properties, list_features, match_property, register_feature, FeatureDefinition
 from .maps import (
     to_osm_map, to_google_maps, to_kml, to_google_my_maps_csv, to_geojson, export_map, generate_map,
@@ -306,6 +307,8 @@ def scrape_property(
 
     site = RealtorScraper(scraper_input)
     results = site.search()
+    if (stats_sink := SEARCH_STATS.get()) is not None:
+        stats_sink.update(site.stats)
 
     if scraper_input.return_type != ReturnType.pandas:
         return results

@@ -100,6 +100,8 @@ class RealtorScraper(Scraper):
         self._location_resolved = False
         self._band = None          #: (low, high) price or sold-date band of a split sub-search
         self._no_split = False     #: set when a piece can't be split any further
+        #: how complete the search was; one dict shared with the copies made for sub-searches
+        self.stats = {"location_found": True, "reported_total": None, "capped": False, "truncated_by_limit": False}
         #: shared by copies made for sub-searches, so they share retries, sessions and block detection
         self.client = PoliteClient(
             base_url=self.SEARCH_GQL_URL,
@@ -667,6 +669,8 @@ class RealtorScraper(Scraper):
         if self.sort_by:
             merged = self._apply_sort(merged)
 
+        if self.limit is not None and len(merged) > self.offset + self.limit:
+            self.stats["truncated_by_limit"] = True
         return merged[self.offset:] if self.limit is None else merged[self.offset:self.offset + self.limit]
 
     # ------------------------------------------------------------------
@@ -946,6 +950,7 @@ class RealtorScraper(Scraper):
         for band in bands:
             remaining = None if limit is None else limit - len(merged)
             if remaining is not None and remaining <= 0:
+                self.stats["truncated_by_limit"] = True  #: bands left unsearched
                 break
             for home in self._band_scraper(dimension, band, remaining)._search_core():
                 property_id = home.get("property_id") if isinstance(home, dict) else home.property_id
@@ -953,6 +958,8 @@ class RealtorScraper(Scraper):
                     seen.add(property_id)
                     merged.append(home)
         merged = self._finalize(merged)
+        if limit is not None and len(merged) > limit:
+            self.stats["truncated_by_limit"] = True
         return merged if limit is None else merged[:limit]
 
     # ------------------------------------------------------------------
@@ -962,6 +969,7 @@ class RealtorScraper(Scraper):
     def _search_core(self):
         location_info = self._get_location_info()
         if not location_info:
+            self.stats["location_found"] = False
             return []
 
         location_type = location_info["area_type"]
@@ -1003,9 +1011,17 @@ class RealtorScraper(Scraper):
         total = result["total"]
         homes = result["properties"]
 
+        if self.stats["reported_total"] is None:
+            self.stats["reported_total"] = total
         if self._needs_cap_split(total, search_type):
             #: more matches than Realtor.com will page through: split into smaller searches
             return self._search_past_cap(total)
+        if total > self._window_end() - self.offset:
+            #: some matches are out of reach: either our own limit or the API cap stopped us
+            if self.limit is not None and self.offset + self.limit <= self.API_RESULT_CAP:
+                self.stats["truncated_by_limit"] = True
+            else:
+                self.stats["capped"] = True
 
         # Fetch remaining pages based on parallel parameter
         if self.offset + self.DEFAULT_PAGE_SIZE < min(total, self._window_end()):
