@@ -285,6 +285,7 @@ def property_points(properties: Any, *, features=None, nearby=None, keywords=Non
             lot_acres = round(float(row["lot_sqft"]) / 43560, 2)
 
         facts = [
+            ("Change", row.get("change")),
             ("Status", status.replace("_", " ").title() if status else None),
             ("Type", str(row["style"]).replace("_", " ").title() if row.get("style") else None),
             ("Beds", _number(row.get("beds"))),

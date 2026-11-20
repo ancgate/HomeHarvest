@@ -15,6 +15,9 @@ from .maps import (
     cluster_properties,
 )
 from .nearby import add_nearby, list_aspects, normalize_proximity, nearby_columns
+from .tracking import (
+    track, get_changes, get_history, get_listings, get_runs, export_changes, map_changes, TrackResult,
+)
 from .locations import (
     get_states, get_state, get_counties, get_cities, get_zip_codes, get_location_hierarchy, aggregate_locations,
     add_place_types,
