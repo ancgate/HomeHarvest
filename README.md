@@ -19,6 +19,7 @@
 - **Real Distances (OpenStreetMap)**: Filter or annotate by distance to cul-de-sacs, water, paved roads, schools, power lines, ...
 - **No 10,000-Result Ceiling**: `limit=None` splits big searches automatically by listing type, price and sold date
 - **Polite Requests**: Shared rate limit, retries with backoff, block detection and outage handling
+- **Tracking Over Time**: Re-run a saved search (e.g. weekly) and get new listings, price cuts, under contract, sold and removed; interrupted runs resume
 - **Maps**: Export to OpenStreetMap (HTML), Google Maps, KML (Google Earth / My Maps), CSV and GeoJSON, with clustering and highlighted matches
 - **Location Lists**: States, counties, cities and ZIP codes, city/town/village types, plus location roll-ups of your results
 - **Opt-in Extra Data**: Property history, environmental risk (flood, fire, heat, wind, air), insurance estimates, rent estimates and neighborhood medians
@@ -381,6 +382,74 @@ places = add_place_types(aggregate_locations(df, by=["state", "city"]))
 properties = scrape_property(location="Austin, TX", listing_type="off_market", mls_status=["expired", "withdrawn"])
 ```
 
+### Tracking Listings Over Time
+
+`track()` runs a saved search (a **watch**) and remembers every listing in a SQLite file. Each later run reports
+what changed since the previous one.
+
+```py
+from homeharvest import track, get_changes, get_history, export_changes, map_changes
+
+result = track(
+    "lehigh-land",                                  # name of the watch
+    location="Lehigh Acres, FL",
+    listing_type=["for_sale", "pending", "sold"],   # default: for_sale, for_rent, pending, sold
+    property_type=["land"],                         # any scrape_property filter works
+    db="homeharvest.db",
+)
+print(result.status)    # done | partial | blocked | network_down | interrupted
+print(result.summary)   # {'new': 41, 'price_cut': 17, 'under_contract': 9, 'sold': 6, 'removed': 12, ...}
+result.changes          # this run's changes, with each listing's data (address, price, URL, ...)
+result.listings         # every listing currently active in the watch
+
+get_changes("homeharvest.db", "lehigh-land", since="2026-11-01", types=["price_cut"])
+get_history("homeharvest.db", property_id="1234567890")             # price/status timeline
+export_changes("homeharvest.db", "lehigh-land", "changes.xlsx")     # Changes, Listings, History, Runs sheets
+map_changes("homeharvest.db", "lehigh-land", "changes.html")        # price cuts / new / back on market in red
+```
+
+| Change | When |
+|---|---|
+| `new` | first time the watch sees the property |
+| `price_cut` / `price_increase` | list price changed (with `amount` and `pct`; under $1 ignored) |
+| `under_contract` / `back_on_market` | for sale/rent ↔ pending or contingent |
+| `sold` | became sold (`new_value` = sold price) |
+| `status_change` | any other status change |
+| `relisted` | seen again after being removed, or got a new listing id |
+| `removed` | no longer found (see below) |
+
+- **Removed is strict.** A listing only counts as removed when every chunk of its area finished cleanly and
+  wasn't capped or cut short. A failed or blocked request never "removes" anything. Sold listings that age out of
+  the search are dropped silently.
+- **Resume.** Each run is split into chunks: one per listing type, or per listing type and ZIP code with
+  `split_by="zip_code"` (better for big areas). If a run is blocked, goes offline or is interrupted (Ctrl-C), the
+  next `track()` call with the same name resumes it and skips finished chunks. `resume=False` starts fresh.
+- **Saved settings.** A watch's search settings are saved with it. Calling it with different settings raises an
+  error, since that would make listings look new or removed. Use another name, or `reset=True` to start over.
+- `include_property_history`, `include_environmental_risk`, `include_insurance` and `include_market_stats` work
+  here too, but only fetch data for listings that are new or changed, which keeps weekly runs cheap.
+- `limit`, `offset` and `return_type` aren't accepted: tracking always collects every match.
+
+**Command line and weekly schedule**
+
+```bash
+python -m homeharvest.tracking lehigh-land --location "Lehigh Acres, FL" --listing-type for_sale pending sold --property-type land --export changes.xlsx --map changes.html
+```
+
+It prints the summary and exits with 0 when the run finished, 1 when it stopped early (run the same command again
+to resume) and 2 for bad arguments. `--help` lists every filter (`--price-max`, `--near cul_de_sac:300ft`,
+`--risk`, `--split-by zip_code`, ...). After `pip install`, the same command is also available as `homeharvest-track`.
+
+To run it every Sunday at 2:00 AM with cron (`crontab -e`):
+
+```bash
+0 2 * * 0 cd /path/to/folder && /path/to/python -m homeharvest.tracking lehigh-land --location "Lehigh Acres, FL" --property-type land --export changes.xlsx
+```
+
+On macOS, scheduled jobs can't read `~/Downloads`, `~/Documents` or `~/Desktop`, so keep the database somewhere
+else, and run long jobs with `caffeinate -i` so the Mac doesn't sleep. Realtor.com may block cloud servers, so
+schedule it on your own machine.
+
 ## Scenarios
 
 ### Scenario 1: Land in Lehigh Acres near a cul-de-sac, with environmental risk
@@ -485,6 +554,18 @@ from homeharvest import scrape_property
 rentals = scrape_property(location="Huntsville, AL", listing_type="for_rent", limit=200, include_market_stats=True)
 rentals["vs_median_rent"] = rentals["list_price"] - rentals["neighborhood_median_rent_price"]
 ```
+
+### Scenario 6: Every week, what changed for land in Lehigh Acres?
+```py
+from homeharvest import track, map_changes
+
+result = track("lehigh-land", location="Lehigh Acres, FL", listing_type=["for_sale", "pending", "sold"],
+               property_type=["land"], near={"cul_de_sac": "300 ft"}, include_environmental_risk=True)
+cuts = result.changes[result.changes["change_type"] == "price_cut"].sort_values("pct")
+print(cuts[["formatted_address", "old_value", "new_value", "pct", "flood_factor_severity", "property_url"]])
+map_changes("homeharvest.db", "lehigh-land", "lehigh_this_week.html")
+```
+
 
 ## Output
 ```plaintext

@@ -242,3 +242,51 @@ def test_map_changes(two_runs, tmp_path):
     assert any(">Removed<" in p["popup"] for p in points)   # removed listings stay on the map at their last location
     highlighted = sum(p["is_match"] for p in points)
     assert highlighted == 3   # price cut, new, back on market
+
+
+# ---------------------------------------------------------------------------
+# Command line (phase 6)
+# ---------------------------------------------------------------------------
+
+def test_cli_runs_reports_and_exports(monkeypatch, tmp_path, capsys):
+    from homeharvest.tracking.__main__ import main
+
+    db = str(tmp_path / "cli.db")
+    argv = ["lehigh", "--location", "Lehigh Acres, FL", "--db", db, "--listing-type", "for_sale", "pending", "sold"]
+    api = Api(monkeypatch, week1())
+    assert main(argv) == 0
+    assert "lehigh: run #1 done, 5 active listings" in capsys.readouterr().out
+
+    api.set(week2())
+    assert main(argv + ["--export", str(tmp_path / "c.xlsx"), "--map", str(tmp_path / "c.html")]) == 0
+    out = capsys.readouterr().out
+    assert "price_cut" in out and "removed" in out and "Changes written to" in out and "Map written to" in out
+    assert (tmp_path / "c.xlsx").exists() and (tmp_path / "c.html").exists()
+
+
+def test_cli_exit_codes(monkeypatch, tmp_path, capsys):
+    from homeharvest.tracking.__main__ import main
+
+    db = str(tmp_path / "cli.db")
+    api = Api(monkeypatch, week1())
+    api.fail_on = ("sold", BlockedError("blocked", response=None))
+    argv = ["w", "--location", "Lehigh Acres, FL", "--db", db, "--listing-type", "for_sale", "sold"]
+    assert main(argv) == 1 and "run the same command again to resume" in capsys.readouterr().out
+    assert main(argv) == 0 and "(resumed)" in capsys.readouterr().out
+    assert main(argv + ["--price-max", "5"]) == 2 and "different search parameters" in capsys.readouterr().err
+
+
+def test_cli_builds_scrape_arguments():
+    from homeharvest.tracking.__main__ import _parser, build_kwargs
+
+    args = _parser().parse_args(["w", "--location", "x", "--property-type", "land", "--price-max", "50000",
+                                 "--near", "cul_de_sac:300ft", "water", "--risk", "--rate", "1"])
+    assert build_kwargs(args) == {"property_type": ["land"], "price_max": 50000,
+                                  "near": {"cul_de_sac": "300ft", "water": None},
+                                  "include_environmental_risk": True, "requests_per_second": 1.0}
+
+
+def test_cli_import_does_not_shadow_track_function():
+    import homeharvest
+    import homeharvest.tracking.__main__  # noqa: F401
+    assert callable(homeharvest.track)

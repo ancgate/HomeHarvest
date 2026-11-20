@@ -1,5 +1,18 @@
 # Plan: track listings over time in HomeHarvest
 
+> **Status: phases 1-6 are implemented** (`homeharvest/tracking/`, tests in `tests/test_offline_search_stats.py`,
+> `tests/test_offline_tracking_store.py`, `tests/test_offline_tracking.py`). Phase 7, the live check, has to run on
+> your machine. Where the implementation deliberately differs from this plan:
+>
+> - **Removals are decided once, at the end of a run, per area** (the whole location, or one ZIP with
+>   `split_by="zip_code"`), and only if *every* chunk of that area finished completely. Per-chunk removal (as first
+>   planned) reported listings that moved between listing types (for sale -> pending -> sold), or into a chunk that
+>   failed, as removed. Tests cover both cases.
+> - Sold listings that age out of the search are deactivated without a `removed` change.
+> - **The command is `python -m homeharvest.tracking`** (also `homeharvest-track` after `pip install`), not
+>   `python -m homeharvest.track`: a `homeharvest/track.py` module would shadow the `homeharvest.track()` function.
+> - Also added: `get_runs()`, `map_changes()`, `TrackResult.chunks`, and `--map` / `--risk` / `--near` CLI options.
+
 **Goal.** Run the same search again and again (for example weekly) and find out what changed since last time:
 new listings, price cuts and increases, listings that went under contract, sold, came back on the market, or
 disappeared. An interrupted run picks up where it stopped. The idea comes from the LandWatch scraper
@@ -26,7 +39,7 @@ get_history("homeharvest.db", property_id="1234567890")           # price/status
 ```
 
 ```bash
-python -m homeharvest.track lehigh-land --location "Lehigh Acres, FL" --listing-type for_sale pending sold --property-type land
+python -m homeharvest.tracking lehigh-land --location "Lehigh Acres, FL" --listing-type for_sale pending sold --property-type land
 ```
 
 ---
@@ -197,12 +210,12 @@ and keeps weekly runs cheap.
 
 ## Phase 6: command line and scheduling
 
-- `python -m homeharvest.track NAME --location ... [--listing-type ...] [--property-type ...] [--split-by zip_code]
+- `python -m homeharvest.tracking NAME --location ... [--listing-type ...] [--property-type ...] [--split-by zip_code]
   [--db PATH] [--export changes.xlsx] [--new-run] [--reset]`, printing the summary. Exit code 0 for done/partial,
   1 otherwise (so schedulers can alert).
 - README section "Tracking listings over time" with the Python and CLI examples, the removal rule, and how to
   schedule it:
-  - macOS/Linux cron: `0 2 * * 0 cd /path/to/project && /path/to/python -m homeharvest.track lehigh-land ...`
+  - macOS/Linux cron: `0 2 * * 0 cd /path/to/project && /path/to/python -m homeharvest.tracking lehigh-land ...`
   - macOS note from the LandWatch README: scheduled jobs can't read `~/Downloads`, `~/Documents` or `~/Desktop`;
     keep the database elsewhere, and use `caffeinate -i` for long runs.
 
@@ -213,7 +226,7 @@ directly) and checks the printed summary and exit code.
 
 1. `pip install -e .` from the merged repo.
 2. Run a small watch twice a few hours apart:
-   `python -m homeharvest.track test-small --location "33971" --listing-type for_sale pending sold --export changes.csv`
+   `python -m homeharvest.tracking test-small --location "33971" --listing-type for_sale pending sold --export changes.csv`
 3. Check: the first run reports everything as `new`; the second reports few changes and no mass `removed`.
 4. Interrupt a run with Ctrl-C and run it again: it should say it's resuming.
 
