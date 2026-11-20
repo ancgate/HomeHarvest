@@ -285,6 +285,7 @@ def property_points(properties: Any, *, features=None, nearby=None, keywords=Non
             lot_acres = round(float(row["lot_sqft"]) / 43560, 2)
 
         facts = [
+            ("Change", row.get("change")),
             ("Status", status.replace("_", " ").title() if status else None),
             ("Type", str(row["style"]).replace("_", " ").title() if row.get("style") else None),
             ("Beds", _number(row.get("beds"))),
@@ -313,7 +314,7 @@ def property_points(properties: Any, *, features=None, nearby=None, keywords=Non
             ("MLS #", row.get("mls_id")),
             ("Agent", row.get("agent_name")),
             ("Broker", row.get("broker_name") or row.get("office_name")),
-        ]
+        ] + _nearby_facts(row)
         facts = [(label, value) for label, value in facts if value not in (None, "", "nan")]
 
         maps_query = quote_plus(f"{lat},{lon}")
@@ -372,6 +373,25 @@ def _keep_near_matches(points: list[dict], radius_miles: float) -> list[dict]:
         point["facts"].insert(0, ("Near match", f"{distance:.2f} mi from {match['address'] or match['title']} ({label})"))
         kept.append(point)
     return kept
+
+
+def _nearby_facts(row: dict) -> list[tuple[str, str]]:
+    """'Cul-de-sac: 109 ft (Oak Ct)' for every <aspect>_ft column that has a <aspect>_name sibling."""
+    from .nearby import ASPECTS, format_distance
+
+    facts = []
+    for key, value in row.items():
+        if not key.endswith("_ft") or f"{key[:-3]}_name" not in row or value is None:
+            continue
+        aspect = key[:-3]
+        try:
+            text = format_distance(float(value))
+        except (TypeError, ValueError):
+            continue
+        name = row.get(f"{aspect}_name")
+        label = ASPECTS[aspect].label if aspect in ASPECTS else aspect.replace("_", " ").capitalize()
+        facts.append((label, f"{text} ({name})" if name else text))
+    return facts
 
 
 def _excerpt(text: Any, limit: int = 220) -> str | None:

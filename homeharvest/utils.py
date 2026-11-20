@@ -137,20 +137,27 @@ OPTIONAL_COLUMNS = {
 }
 
 
-def get_columns(extra_groups=None) -> list[str]:
-    """Base DataFrame columns plus any optional column groups (see OPTIONAL_COLUMNS)."""
+def get_columns(extra_groups=None, extra_columns=None) -> list[str]:
+    """Base DataFrame columns plus optional column groups (see OPTIONAL_COLUMNS) and extra columns."""
     columns = list(ordered_properties)
     for group in extra_groups or []:
         for column in OPTIONAL_COLUMNS.get(group, []):
             if column not in columns:
                 columns.append(column)
+    for column in extra_columns or []:
+        if column not in columns:
+            columns.append(column)
     return columns
 
 
-def process_result(result: Property, extra_groups=None) -> pd.DataFrame:
-    columns = get_columns(extra_groups)
+def process_result(result: Property, extra_groups=None, extra_columns=None) -> pd.DataFrame:
+    nearby_columns = [f"{aspect}_{suffix}" for aspect in (result.nearby or {}) for suffix in ("ft", "name")]
+    columns = get_columns(extra_groups, list(extra_columns or []) + nearby_columns)
     prop_data = {prop: None for prop in columns}
     prop_data.update(result.model_dump())
+    for aspect, feature in (result.nearby or {}).items():
+        prop_data[f"{aspect}_ft"] = feature.distance_ft
+        prop_data[f"{aspect}_name"] = feature.name
 
     if "address" in prop_data and prop_data["address"]:
         address_data = prop_data["address"]
@@ -364,11 +371,10 @@ def validate_dates(date_from: str | None, date_to: str | None) -> None:
         )
 
 
-def validate_limit(limit: int) -> None:
-    #: 1 -> 10000 limit
-
-    if limit is not None and (limit < 1 or limit > 10000):
-        raise ValueError("Property limit must be between 1 and 10,000.")
+def validate_limit(limit: int | None) -> None:
+    #: None = no limit; above 10,000 the search is split automatically (see RealtorScraper._search_past_cap)
+    if limit is not None and limit < 1:
+        raise ValueError("Property limit must be at least 1 (or None for no limit).")
 
 
 def validate_offset(offset: int, limit: int = 10000) -> None:
@@ -384,12 +390,12 @@ def validate_offset(offset: int, limit: int = 10000) -> None:
     if offset is not None and offset < 0:
         raise ValueError("Offset must be non-negative (>= 0).")
 
-    # Check if offset + limit exceeds API's hard limit of 10,000
-    if offset is not None and limit is not None and (offset + limit) > 10000:
+    # offset pages within one search window of 10,000; past that the search is split automatically
+    if offset and (limit is None or offset + limit > 10000):
         raise ValueError(
-            f"offset ({offset}) + limit ({limit}) = {offset + limit} exceeds API maximum of 10,000. "
-            f"The API cannot return results beyond position 10,000. "
-            f"To fetch more results, narrow your search."
+            f"offset ({offset}) + limit ({limit}) goes past the API maximum of 10,000. "
+            "Use offset=0 with limit=None (or a limit above 10,000): larger searches are split "
+            "automatically by listing type, price and sold date."
         )
 
     # Warn if offset is not a multiple of 200 (API page size)

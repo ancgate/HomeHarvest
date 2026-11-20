@@ -257,9 +257,18 @@ class Property(BaseModel):
     environmental_risk: EnvironmentalRisk | None = Field(None, description="Flood, fire, heat, wind, air and noise risk (include_environmental_risk=True)")
     insurance: InsuranceInfo | None = Field(None, description="Homeowner's insurance estimate and flood/fire quotes (include_insurance=True)")
     market_stats: MarketStats | None = Field(None, description="Rent estimate and neighborhood/ZIP medians (include_market_stats=True)")
+    nearby: dict[str, NearbyFeature] | None = Field(None, description="Nearest OpenStreetMap feature per aspect (near / far_from / add_nearby)")
 
 
 # Specialized models for GraphQL types
+
+class NearbyFeature(BaseModel):
+    distance_ft: int | None = Field(None, description="Distance in feet to the nearest feature; None if none within the search radius")
+    name: str | None = Field(None, description="OSM name (or ref) of the feature")
+    osm_type: str | None = None
+    osm_id: int | None = None
+    osm_url: str | None = None
+
 
 class PropertyHistoryEvent(BaseModel):
     date: datetime | None = None

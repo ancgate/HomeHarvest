@@ -8,15 +8,22 @@ from .utils import (
     convert_to_datetime_string, extract_timedelta_hours, extract_timedelta_days, detect_precision_and_convert
 )
 from .core.scrapers.realtor import RealtorScraper
+from ._context import SEARCH_STATS
 from .features import FeatureMatcher, filter_properties, list_features, match_property, register_feature, FeatureDefinition
 from .maps import (
     to_osm_map, to_google_maps, to_kml, to_google_my_maps_csv, to_geojson, export_map, generate_map,
     cluster_properties,
 )
+from .nearby import add_nearby, list_aspects, normalize_proximity, nearby_columns
+from .tracking import (
+    track, get_changes, get_history, get_listings, get_runs, export_changes, map_changes, TrackResult,
+)
 from .locations import (
-    get_states, get_state, get_counties, get_cities, get_zip_codes, get_location_hierarchy, aggregate_locations
+    get_states, get_state, get_counties, get_cities, get_zip_codes, get_location_hierarchy, aggregate_locations,
+    add_place_types,
 )
 from .core.scrapers.models import ListingType, SearchPropertyType, ReturnType, Property
+from .exceptions import AuthenticationError, BlockedError, NetworkError, RequestFailedError
 from typing import Union, Optional, List
 
 def scrape_property(
@@ -33,7 +40,7 @@ def scrape_property(
     foreclosure: bool = None,
     extra_property_data: bool = True,
     exclude_pending: bool = False,
-    limit: int = 10000,
+    limit: int | None = 10000,
     offset: int = 0,
     # New date/time filtering parameters
     past_hours: int | timedelta = None,
@@ -70,6 +77,13 @@ def scrape_property(
     include_environmental_risk: bool = False,
     include_insurance: bool = False,
     include_market_stats: bool = False,
+    # Polite request handling
+    requests_per_second: float | None = 2.0,
+    max_retries: int = 4,
+    # Real distances to OpenStreetMap features
+    near: dict | list | str = None,
+    far_from: dict | list | str = None,
+    overpass_url: str = None,
 ) -> Union[pd.DataFrame, list[dict], list[Property]]:
     """
     Scrape properties from Realtor.com based on a given location and listing type.
@@ -99,7 +113,10 @@ def scrape_property(
     :param foreclosure: If set, fetches only foreclosure listings.
     :param extra_property_data: Increases requests by O(n). If set, this fetches additional property data (e.g. agent, broker, property evaluations etc.)
     :param exclude_pending: If true, this excludes pending or contingent properties from the results, unless listing type is pending.
-    :param limit: Limit the number of results returned. Maximum is 10,000.
+    :param limit: Limit the number of results returned (default 10,000). Realtor.com returns at most 10,000
+        results per search; with limit=None (or a larger limit) the search is split automatically by listing
+        type, then price bands (for sale / for rent / pending) or sold-date ranges (sold) until every piece
+        fits. Off-market searches can't be split and stop at 10,000 (with a warning).
     :param offset: Starting position for pagination within the 10k limit (offset + limit cannot exceed 10,000). Use with limit to fetch results in chunks (e.g., offset=200, limit=200 fetches results 200-399). Should be a multiple of 200 (page size) for optimal performance. Default is 0. Note: Cannot be used to bypass the 10k API limit - use date ranges (date_from/date_to) to narrow searches and fetch more data.
 
     New parameters:
@@ -148,6 +165,25 @@ def scrape_property(
     :param include_market_stats: Realtor.com rent estimate plus neighborhood and ZIP medians
         (median rent, listing price, sold price, price per sqft, days on market).
 
+    Real distances to OpenStreetMap features (see homeharvest.list_aspects()):
+    :param near: Keep listings within a distance of each aspect, e.g. {"cul_de_sac": "300 ft", "water": "0.5 mi"}.
+        A list uses each aspect's default radius. Aspects: cul_de_sac, dead_end, road, paved_road, dirt_road,
+        major_road, freeway, water, lake, river, canal, coastline, beach, wetland, park, protected_area, forest,
+        golf_course, school, hospital, fire_station, grocery, gas_station, town, airport, railroad, power_line,
+        substation, cell_tower, landfill, industrial, cemetery, boat_ramp, marina, or a raw OSM tag such as
+        "leisure=marina". Numbers are feet; strings may use ft, mi, m, km, yd.
+    :param far_from: Keep listings with no such feature within the distance, e.g. {"power_line": "500 ft"}.
+        Adds <aspect>_ft and <aspect>_name columns. Runs after the other filters (and after `limit`), using
+        the public Overpass API (cached for 7 days); listings without coordinates are dropped.
+    :param overpass_url: Another Overpass endpoint (also via the HOMEHARVEST_OVERPASS_URL env var).
+
+    Polite request handling:
+    :param requests_per_second: Shared rate limit for all requests to Realtor.com in this process
+        (default 2.0, with +/-20% jitter). None or 0 disables it.
+    :param max_retries: Attempts per request for HTTP 403/429/5xx and bot-challenge answers, with
+        exponential backoff (honors Retry-After). After 10 consecutive failures BlockedError is raised;
+        network outages are waited out for 3 minutes before NetworkError.
+
     Note: past_days and past_hours also accept timedelta objects for more Pythonic usage.
     """
     validate_input(listing_type)
@@ -161,9 +197,16 @@ def scrape_property(
 
     if isinstance(mls_status, str):
         mls_status = [mls_status]
+    if requests_per_second is not None and requests_per_second < 0:
+        raise ValueError("requests_per_second must be positive, or None/0 to disable the rate limit.")
+    if max_retries < 1:
+        raise ValueError("max_retries must be at least 1.")
 
     #: validate feature keys / match mode up front (raises ValueError with suggestions)
     feature_matcher = FeatureMatcher(features=features, nearby=nearby, keywords=keywords, match_mode=match_mode)
+    near_spec = normalize_proximity(near, "near")
+    far_spec = normalize_proximity(far_from, "far_from")
+    proximity_columns = nearby_columns({**near_spec, **far_spec})
 
     # Validate new last_update_date filtering parameters
     validate_last_update_filters(
@@ -258,10 +301,17 @@ def scrape_property(
         match_mode=match_mode,
         include_insurance=include_insurance,
         include_market_stats=include_market_stats,
+        requests_per_second=requests_per_second,
+        max_retries=max_retries,
+        near=near,
+        far_from=far_from,
+        overpass_url=overpass_url,
     )
 
     site = RealtorScraper(scraper_input)
     results = site.search()
+    if (stats_sink := SEARCH_STATS.get()) is not None:
+        stats_sink.update(site.stats)
 
     if scraper_input.return_type != ReturnType.pandas:
         return results
@@ -275,9 +325,11 @@ def scrape_property(
             ("market_stats", include_market_stats),
         ) if enabled
     ]
-    columns = get_columns(extra_groups)
+    columns = get_columns(extra_groups, proximity_columns)
 
-    properties_dfs = [df for result in results if not (df := process_result(result, extra_groups)).empty]
+    properties_dfs = [
+        df for result in results if not (df := process_result(result, extra_groups, proximity_columns)).empty
+    ]
     if not properties_dfs:
         return pd.DataFrame()
 

@@ -1,5 +1,5 @@
 from __future__ import annotations
-from typing import Union
+from typing import Any, Union
 
 import requests
 import uuid
@@ -45,7 +45,7 @@ class ScraperInput(BaseModel):
     foreclosure: bool | None = False
     extra_property_data: bool | None = True
     exclude_pending: bool | None = False
-    limit: int = 10000
+    limit: int | None = 10000
     offset: int = 0
     return_type: ReturnType = ReturnType.pandas
 
@@ -91,6 +91,15 @@ class ScraperInput(BaseModel):
     include_environmental_risk: bool = False
     include_insurance: bool = False
     include_market_stats: bool = False
+
+    # Polite request handling
+    requests_per_second: float | None = 2.0
+    max_retries: int = 4
+
+    # OpenStreetMap proximity filters (see homeharvest.nearby)
+    near: Any = None
+    far_from: Any = None
+    overpass_url: str | None = None
 
 
 class Scraper:
@@ -164,6 +173,15 @@ class Scraper:
         self.include_environmental_risk = scraper_input.include_environmental_risk
         self.include_insurance = scraper_input.include_insurance
         self.include_market_stats = scraper_input.include_market_stats
+
+        # Polite request handling
+        self.requests_per_second = scraper_input.requests_per_second
+        self.max_retries = scraper_input.max_retries
+
+        # OpenStreetMap proximity filters
+        self.near = scraper_input.near
+        self.far_from = scraper_input.far_from
+        self.overpass_url = scraper_input.overpass_url
 
     def search(self) -> list[Union[Property | dict]]: ...
 
