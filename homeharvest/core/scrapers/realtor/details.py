@@ -182,12 +182,27 @@ def _quotes(quotes: list[dict] | None) -> list[InsuranceQuote] | None:
     return parsed or None
 
 
+def _average_rates(rates: list[dict] | None) -> list[dict] | None:
+    out = []
+    for item in rates or []:
+        if not isinstance(item, dict):
+            continue
+        loan_type = item.get("loan_type") or {}
+        out.append({"rate": _to_float(item.get("rate")), "loan_type": loan_type.get("display_name"),
+                    "term": _to_int(loan_type.get("term")), "is_fixed": loan_type.get("is_fixed"),
+                    "is_va_loan": loan_type.get("is_va_loan"), "loan_id": loan_type.get("loan_id")})
+    return out or None
+
+
 def parse_insurance(detail: dict) -> InsuranceInfo | None:
     mortgage = detail.get("mortgage") or {}
     estimate = mortgage.get("estimate") or {}
     local = detail.get("local") or {}
     flood = local.get("flood") or {}
     wildfire = local.get("wildfire") or {}
+
+    rate = estimate.get("average_rate") or {}
+    loan_type = rate.get("loan_type") or {}
 
     expenses = {}
     for item in estimate.get("monthly_payment_details") or []:
@@ -203,6 +218,16 @@ def parse_insurance(detail: dict) -> InsuranceInfo | None:
         mortgage_insurance_monthly=expenses.get("mortgage_insurance"),
         principal_and_interest_monthly=expenses.get("principal_and_interest"),
         estimated_monthly_payment=_to_int(estimate.get("monthly_payment")),
+        mortgage_rate=_to_float(rate.get("rate")),
+        loan_type=loan_type.get("display_name"),
+        loan_term_years=_to_int(loan_type.get("term")),
+        loan_amount=_to_int(estimate.get("loan_amount")),
+        down_payment=_to_int(estimate.get("down_payment")),
+        closing_cost=_to_int(mortgage.get("closing_cost")),
+        closing_cost_rate=str(mortgage["closing_cost_rate"]) if mortgage.get("closing_cost_rate") is not None else None,
+        due_at_close=_to_int(mortgage.get("due_at_close")),
+        total_payment=_to_int(estimate.get("total_payment")),
+        average_rates=_average_rates(mortgage.get("average_rates")),
         flood_insurance_requirement=flood.get("insurance_requirement"),
         flood_insurance_quotes=_quotes(flood.get("insurance_rates")),
         fire_insurance_quotes=_quotes(wildfire.get("insurance_rates")),

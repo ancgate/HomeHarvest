@@ -268,7 +268,7 @@ filters or a `limit`. Flags can be combined; they share one request per batch.
 |---|---|
 | `include_property_history=True` | `property_history` (date, event, price, price change, source), `original_list_price`, `last_price_change_amount/date`, buyer agent from past sales |
 | `include_environmental_risk=True` | First Street `flood/fire/heat/wind/air_factor_score` (1-10) + `_severity`, `flood_fema_zone`, `flood_insurance_requirement`, `noise_score`, `environmental_risk_url` |
-| `include_insurance=True` | `home_insurance_monthly`, `insurance_rate`, `property_tax_rate/monthly`, `estimated_monthly_payment`, flood/fire insurance quotes |
+| `include_insurance=True` | Realtor.com's monthly payment card: `estimated_monthly_payment`, `principal_and_interest_monthly`, `property_tax_monthly`, `home_insurance_monthly`, `hoa_monthly`, `mortgage_insurance_monthly`, `mortgage_rate`, `loan_type`, `loan_amount`, `down_payment`, `closing_cost`, `due_at_close`, plus `insurance_rate`, `property_tax_rate` and flood/fire insurance quotes |
 | `include_market_stats=True` | `estimated_rent` (+ low/high), neighborhood and ZIP medians: rent, listing price, sold price, price/sqft, days on market |
 
 ```py
@@ -284,6 +284,45 @@ print(properties[["formatted_address", "list_price", "original_list_price", "flo
 
 With `return_type="pydantic"` the same data is on `prop.property_history`, `prop.environmental_risk`,
 `prop.insurance` and `prop.market_stats`; with `return_type="raw"` it is merged into the raw JSON.
+
+### Monthly Payment Simulation
+
+`homeharvest.mortgage` uses the same arithmetic as Realtor.com's "RealCost" monthly payment card, so you can try
+other rates, down payments or terms. Realtor.com doesn't publish its formula; this one was reverse-engineered from a
+card and reproduces it to the dollar ($495,000, 20% down, 30-year at 6.160% -> $2,415 + $639 + $582 = $3,636/month,
+$118,800 due at close).
+
+| Part | Formula |
+|---|---|
+| Principal & interest | `loan * r / (1 - (1 + r) ** -n)`, `r` = annual rate / 12, `n` = months, loan = price - down payment |
+| Property tax | price x annual tax rate / 12 |
+| Home insurance | price x annual insurance rate / 12 |
+| HOA | the listing's monthly HOA fee |
+| Mortgage insurance | only below 20% down: loan x annual PMI rate / 12. **The 0.5% default is an assumption** (Realtor.com's rate is unknown) |
+| Monthly total | sum of the parts, each rounded to the dollar |
+| Due at close | down payment + closing costs (default 4% of the price) |
+
+```py
+from homeharvest import estimate_payment, simulate, amortization_schedule, estimate_from_listing, add_payment_estimates
+
+print(estimate_payment(495_000, interest_rate_pct=6.16, property_tax_pct=1.549, home_insurance_pct=1.411))
+# $3,636/month  (home $495,000, 20% down, 30-year at 6.16%) ... Due at close $118,800
+
+# Every combination of the values you vary
+grid = simulate(495_000, interest_rate_pct=[5.5, 6.16, 7.0], down_payment_pct=[5, 10, 20],
+                property_tax_pct=1.549, home_insurance_pct=1.411, mortgage_insurance_pct=0.5)
+
+# Month by month (PMI stops at 78% of the price); try paying extra
+schedule = amortization_schedule(495_000, interest_rate_pct=6.16, down_payment_pct=10, extra_principal_monthly=300)
+
+# On scraped listings: each listing's own tax/insurance rates, HOA and mortgage rate (include_insurance=True)
+df = scrape_property("Missouri City, TX", listing_type="for_sale", limit=50, include_insurance=True)
+estimate_from_listing(df.iloc[0], down_payment_pct=10)
+df = add_payment_estimates(df, down_payment_pct=10, interest_rate_pct=6.5)   # sim_total_monthly, sim_due_at_close, ...
+```
+
+Inputs are in percent (`interest_rate_pct=6.16`, `property_tax_pct=1.549`); annual dollar amounts work too
+(`property_tax_annual=7668`). It's an estimate: lenders' rates, PMI and closing costs vary.
 
 ### Maps (OpenStreetMap, Google Maps, KML, CSV, GeoJSON)
 
@@ -837,10 +876,14 @@ Property
 │ └── environmental_risk_url
 
 ├── Insurance (include_insurance=True):
+│ ├── estimated_monthly_payment
+│ ├── principal_and_interest_monthly / hoa_monthly / mortgage_insurance_monthly
 │ ├── home_insurance_monthly
 │ ├── insurance_rate
 │ ├── property_tax_rate / property_tax_monthly
-│ ├── estimated_monthly_payment
+│ ├── mortgage_rate / loan_type / loan_term_years
+│ ├── loan_amount / down_payment
+│ ├── closing_cost / closing_cost_rate / due_at_close
 │ └── flood_insurance_quotes / fire_insurance_quotes
 
 ├── Market Stats (include_market_stats=True):

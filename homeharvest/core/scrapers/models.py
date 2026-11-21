@@ -324,6 +324,16 @@ class InsuranceInfo(BaseModel):
     mortgage_insurance_monthly: int | None = None
     principal_and_interest_monthly: int | None = None
     estimated_monthly_payment: int | None = Field(None, description="Total estimated monthly ownership cost")
+    mortgage_rate: float | None = Field(None, description="Interest rate used for the estimate (as Realtor.com reports it)")
+    loan_type: str | None = Field(None, description="e.g. 30-year fixed")
+    loan_term_years: int | None = None
+    loan_amount: int | None = None
+    down_payment: int | None = None
+    closing_cost: int | None = None
+    closing_cost_rate: str | None = Field(None, description="Closing cost rate as Realtor.com reports it")
+    due_at_close: int | None = Field(None, description="Total due at close (down payment + closing costs)")
+    total_payment: int | None = Field(None, description="Realtor.com's total_payment for the estimate")
+    average_rates: list[dict] | None = Field(None, description="Average rates by loan type: [{rate, loan_type, term, ...}]")
     flood_insurance_requirement: str | None = None
     flood_insurance_quotes: list[InsuranceQuote] | None = None
     fire_insurance_quotes: list[InsuranceQuote] | None = None
