@@ -841,8 +841,22 @@ DETAIL_INSURANCE_FIELDS = """
     mortgage {
         insurance_rate
         property_tax_rate
+        due_at_close
+        closing_cost
+        closing_cost_rate
+        average_rates {
+            rate
+            loan_type { loan_id term display_name is_fixed is_va_loan }
+        }
         estimate {
             monthly_payment
+            total_payment
+            loan_amount
+            down_payment
+            average_rate {
+                rate
+                loan_type { loan_id term display_name is_fixed is_va_loan }
+            }
             monthly_payment_details {
                 type
                 amount

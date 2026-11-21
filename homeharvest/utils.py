@@ -117,6 +117,17 @@ OPTIONAL_COLUMNS = {
         "property_tax_rate",
         "property_tax_monthly",
         "estimated_monthly_payment",
+        "principal_and_interest_monthly",
+        "hoa_monthly",
+        "mortgage_insurance_monthly",
+        "mortgage_rate",
+        "loan_type",
+        "loan_term_years",
+        "loan_amount",
+        "down_payment",
+        "closing_cost",
+        "closing_cost_rate",
+        "due_at_close",
         "flood_insurance_requirement",
         "flood_insurance_quotes",
         "fire_insurance_quotes",
@@ -305,6 +316,8 @@ def _flatten_optional_groups(result: Property, prop_data: dict, extra_groups) ->
         prop_data["property_tax_rate"] = insurance.property_tax_rate
         prop_data["property_tax_monthly"] = insurance.property_tax_monthly
         prop_data["estimated_monthly_payment"] = insurance.estimated_monthly_payment
+        for column in ['principal_and_interest_monthly', 'hoa_monthly', 'mortgage_insurance_monthly', 'mortgage_rate', 'loan_type', 'loan_term_years', 'loan_amount', 'down_payment', 'closing_cost', 'closing_cost_rate', 'due_at_close']:
+            prop_data[column] = getattr(insurance, column)
         prop_data["flood_insurance_quotes"] = (
             [q.model_dump() for q in insurance.flood_insurance_quotes] if insurance.flood_insurance_quotes else None
         )
